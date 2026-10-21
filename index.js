@@ -98,7 +98,7 @@ function stEventTypes() {
 }
 
 const EXT_ID = 'hp-deeplore';
-const EXT_VER = 'v1.11.0';
+const EXT_VER = 'v1.12.0';
 const EXT_NAME = 'HP DeepLore';
 const DB_NAME = 'hp_deeplore';
 const DB_VER = 1;
@@ -1599,23 +1599,22 @@ function ensurePickerStyle() {
 .hp-picker-mask{
   position:fixed;inset:0;z-index:10050;
   background:rgba(0,0,0,.55);
-  display:flex;align-items:center;justify-content:center;
-  padding:16px;box-sizing:border-box;
 }
-/* 关键：用 fixed + inset 居中，不用 absolute + transform，
-   彻底避免 transform 与移动端 !important 打架 */
+/* 【修 v1.12】不再用 transform 居中：
+   1) 宿主页面（SillyTavern 主题）给 body 加了 transform/filter 时，
+      position:fixed 的包含块会变成该祖先，left/top:50% 就不再是视口中心；
+   2) 移动端 media query 的 !important 会覆盖 inline 的 left/top，
+      却覆盖不了 inline transform → 面板先被钉到左上、再往左上平移一半而飞出屏幕。
+   现在由 JS 按视口实测尺寸算出精确 px 的 left/top/width/height 并直接写入。 */
 .hp-picker{
   position:fixed;
-  left:50%;top:50%;
-  transform:translate(-50%,-50%);
-  width:min(560px,100%);
-  max-width:min(560px,calc(100vw - 24px));
-  max-height:min(80vh,calc(100dvh - 32px));
+  transform:none;
   display:flex;flex-direction:column;
   background:var(--hp-panel,#151922);
   border:1px solid var(--hp-bd2,#2a3040);
   border-radius:14px;overflow:hidden;
   box-shadow:0 12px 40px rgba(0,0,0,.5);
+  box-sizing:border-box;
 }
 .hp-picker-head{
   display:flex;align-items:center;gap:9px;flex:0 0 auto;
@@ -1643,7 +1642,8 @@ function ensurePickerStyle() {
 }
 .hp-picker-input:focus{outline:none;border-color:var(--hp-acc,#4a9d7a)}
 .hp-picker-list{
-  flex:1;overflow:auto;min-height:120px;
+  flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;
+  -webkit-overflow-scrolling:touch;overscroll-behavior:contain;
   border:1px solid var(--hp-bd,#232936);border-radius:8px;
   background:var(--hp-card,#12161d);
 }
@@ -1667,12 +1667,6 @@ function ensurePickerStyle() {
 .hp-picker-empty{padding:14px;color:var(--hp-tx3,#7a8497);font-size:12.5px;text-align:center}
 
 @media (max-width:720px){
-  .hp-picker-mask{padding:12px}
-  .hp-picker{
-    width:100%;max-width:calc(100vw - 24px);
-    max-height:calc(100dvh - 40px);
-    left:50%;top:50%;transform:translate(-50%,-50%);
-  }
   .hp-picker-item{padding:13px 12px;font-size:13.5px}
   .hp-picker-input{font-size:15px;padding:11px}
   .hp-picker-btn{padding:11px 18px;font-size:13.5px}
@@ -1685,6 +1679,79 @@ function ensurePickerStyle() {
 @keyframes hp-picker-in{from{opacity:0}to{opacity:1}}
 `;
   document.head.appendChild(st);
+}
+
+
+/* --------------------------------------------------------------------------
+ * 弹层精确定位：写入 px 级 left/top/width/height，保证居中且完整可见
+ * -------------------------------------------------------------------------- */
+function placePicker(box) {
+  if (!box) return;
+  try {
+    const vv = window.visualViewport;
+    // 优先用 visualViewport：手机地址栏收放时它才是真实可视区
+    const vw = Math.round((vv && vv.width) || window.innerWidth || document.documentElement.clientWidth);
+    const vh = Math.round((vv && vv.height) || window.innerHeight || document.documentElement.clientHeight);
+    const margin = vw < 560 ? 12 : 16;
+
+    // 先量一次自然高度（未限高时），决定最终高度
+    box.style.position = 'fixed';
+    box.style.left = '0px';
+    box.style.top = '0px';
+    box.style.width = Math.min(560, vw - margin * 2) + 'px';
+    const natural = box.scrollHeight || box.offsetHeight || 0;
+
+    const maxH = vh - margin * 2;
+    const wantH = Math.min(Math.round(vh * 0.82), natural || Math.round(vh * 0.82));
+    const h = Math.max(220, Math.min(wantH, maxH));
+    const w = Math.min(560, vw - margin * 2);
+
+    let left = Math.round((vw - w) / 2);
+    let top = Math.round((vh - h) / 2);
+    left = Math.max(margin, Math.min(left, vw - w - margin));
+    top = Math.max(margin, Math.min(top, vh - h - margin));
+
+    box.style.width = w + 'px';
+    box.style.height = h + 'px';
+    box.style.maxWidth = w + 'px';
+    box.style.maxHeight = h + 'px';
+    box.style.left = left + 'px';
+    box.style.top = top + 'px';
+    box.style.right = 'auto';
+    box.style.bottom = 'auto';
+    box.style.transform = 'none';
+
+    // 【修 v1.12】收敛补偿：无论 fixed 的包含块被哪个祖先改写，
+    // 直接按"实测位置 vs 期望位置"的差值反复校正，最多 3 轮。
+    // 这样即使宿主给 html/body/祖先加了 transform、zoom、filter 也能居中。
+    for (let k = 0; k < 3; k++) {
+      const r = box.getBoundingClientRect();
+      const dx = Math.round(r.left - left);
+      const dy = Math.round(r.top - top);
+      if (Math.abs(dx) <= 1 && Math.abs(dy) <= 1) return;
+      box.style.left = (left - dx) + 'px';
+      box.style.top = (top - dy) + 'px';
+    }
+    // 仍未对齐 → 退化为 absolute 并再补偿一轮
+    box.style.position = 'absolute';
+    box.style.left = (left + window.scrollX) + 'px';
+    box.style.top = (top + window.scrollY) + 'px';
+    for (let k = 0; k < 2; k++) {
+      const r = box.getBoundingClientRect();
+      const dx = Math.round(r.left - left);
+      const dy = Math.round(r.top - top);
+      if (Math.abs(dx) <= 1 && Math.abs(dy) <= 1) break;
+      box.style.left = (parseFloat(box.style.left || '0') - dx) + 'px';
+      box.style.top = (parseFloat(box.style.top || '0') - dy) + 'px';
+    }
+    console.warn('[HP-DeepLore] fixed 包含块异常，弹层已用 absolute 校正');
+  } catch (e) {
+    // 兜底：居中即可，不因定位失败而挡住内容
+    box.style.position = 'fixed';
+    box.style.left = '50%';
+    box.style.top = '50%';
+    box.style.transform = 'translate(-50%,-50%)';
+  }
 }
 
 /* --------------------------------------------------------------------------
@@ -1721,7 +1788,9 @@ function openModelPicker(list, current, onPick) {
           </div>
         </div>
       </div>`;
-    document.body.appendChild(mask);
+    // 【修 v1.12】挂到 html 而非 body：宿主主题常给 body 加 transform，
+    // 那会把 fixed 的包含块改写成 body，导致居中失效。html 极少被加 transform。
+    document.documentElement.appendChild(mask);
 
     const listEl = mask.querySelector('#hp-mp-list');
     const searchEl = mask.querySelector('#hp-mp-search');
@@ -1752,7 +1821,7 @@ function openModelPicker(list, current, onPick) {
     render('');
     searchEl.oninput = () => render(searchEl.value);
 
-    const close = () => mask.remove();
+    const close = () => { try { mask.__cleanup && mask.__cleanup(); } catch (e) {} mask.remove(); };
     mask.querySelector('#hp-mp-close').onclick = close;
     mask.addEventListener('click', e => { if (e.target === mask) close(); });
     mask.querySelector('#hp-mp-ok').onclick = () => {
@@ -1762,6 +1831,28 @@ function openModelPicker(list, current, onPick) {
     };
     const escHandler = (e) => { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', escHandler); } };
     document.addEventListener('keydown', escHandler);
+
+    // 【修 v1.12】精确居中：按「视口实测尺寸」写死 px，并在祖先有 transform
+    // （fixed 包含块被改写）时自动切换为 absolute + 滚动偏移，保证永远居中可见。
+    const box = mask.querySelector('.hp-picker');
+    placePicker(box);
+    mask.__repos = () => placePicker(box);
+    window.addEventListener('resize', mask.__repos);
+    window.addEventListener('orientationchange', mask.__repos);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', mask.__repos);
+      window.visualViewport.addEventListener('scroll', mask.__repos);
+    }
+    // 关闭时清理监听
+    const origClose = close;
+    mask.__cleanup = () => {
+      window.removeEventListener('resize', mask.__repos);
+      window.removeEventListener('orientationchange', mask.__repos);
+      if (window.visualViewport) {
+        window.visualViewport.removeEventListener('resize', mask.__repos);
+        window.visualViewport.removeEventListener('scroll', mask.__repos);
+      }
+    };
   } catch (e) {
     // 兜底：万一弹层失败，退回手填，避免功能完全不可用
     const v = prompt('无法弹出列表，请手动输入模型 ID：\n\n' + list.slice(0, 40).join('\n'), current || list[0] || '');
