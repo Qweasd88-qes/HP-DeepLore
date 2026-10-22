@@ -310,7 +310,7 @@ function stEventTypes() {
 }
 
 const EXT_ID = 'hp-deeplore';
-const EXT_VER = 'v1.28.0';
+const EXT_VER = 'v1.29.0';
 const EXT_NAME = 'HP DeepLore';
 const DB_NAME = 'hp_deeplore';
 const DB_VER = 2;   /* 【修 v1.28】+1：新增 settings store，用于配置兜底存储 */
@@ -2206,7 +2206,7 @@ function wbCurrentName() {
     const c = stGetContext() || {};
     const n = c.worldInfoName || c.world_info_name || c.worldInfo?.name || c.world_info?.name
       || (typeof c.getWorldInfoName === 'function' ? c.getWorldInfoName() : null);
-    if (n) return String(n);
+    if (n && !/^\d+$/.test(String(n).trim())) return String(n).trim();
     const S = ST();
     if (typeof S.getCurrentWorldInfoName === 'function') {
       const g = String(S.getCurrentWorldInfoName() || '');
@@ -2215,26 +2215,75 @@ function wbCurrentName() {
     /* DOM 兜底：世界书下拉框 / 编辑器选择框 */
     try {
       const sel = document.querySelector('#world_info_select, #world_editor_select, .world_info_select, select#world_info');
-      const v = sel && (sel.value || (sel.options && sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]?.text));
-      if (v && String(v).trim() && !/^(select|选择)/i.test(String(v))) return String(v).trim();
+      const v = sel && ((sel.options && sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]?.text) || sel.value);
+      /* 【修 v1.29】纯数字不是世界书名（实测误读到 "29"），一律丢弃继续找 */
+      if (v && String(v).trim() && !/^\d+$/.test(String(v).trim()) && !/^(select|选择)/i.test(String(v))) return String(v).trim();
     } catch (e) { /* 忽略 */ }
     /* 全局兜底 */
     if (typeof window !== 'undefined') {
       const w = window.world_info_name || window.worldInfoName || window.currentWorldInfoName;
-      if (w) return String(w);
+      if (w && !/^\d+$/.test(String(w).trim())) return String(w).trim();
     }
   } catch (e) { /* 忽略 */ }
   return null;
 }
 
+/* 【修 v1.29】ST 开了 CSRF 保护时，裸 POST 一律 403（检测面板那个 HTTP 403 就是它）。
+   从 meta / 全局 / ST 工具函数多处取 token，逐个试；都失败时把原因说清楚。 */
+function stCsrfToken() {
+  const cand = [];
+  try {
+    const m = document.querySelector('meta[name="csrf-token"]') || document.querySelector('meta[name="csrf_token"]');
+    if (m) { const v = m.getAttribute('content') || m.content; if (v) cand.push(v); }
+  } catch (e) { /* 忽略 */ }
+  try { if (window.csrfToken) cand.push(window.csrfToken); } catch (e) { /* 忽略 */ }
+  try { if (window.CSRF_TOKEN) cand.push(window.CSRF_TOKEN); } catch (e) { /* 忽略 */ }
+  try { const S = ST(); if (S && typeof S.getCsrfToken === 'function') { const t = S.getCsrfToken(); if (t) cand.push(t); } } catch (e) { /* 忽略 */ }
+  try { const S = ST(); if (S && typeof S.getRequestHeaders === 'function') { const h = S.getRequestHeaders() || {}; if (h['X-CSRF-Token']) cand.push(h['X-CSRF-Token']); } } catch (e) { /* 忽略 */ }
+  return cand.filter(Boolean);
+}
+
+async function stPost(path, body) {
+  const toks = stCsrfToken();
+  const tries = toks.length ? toks : [''];
+  let lastErr = null;
+  for (const t of tries) {
+    let r = null;
+    try {
+      const h = { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' };
+      if (t) h['X-CSRF-Token'] = t;
+      r = await fetch(path, { method: 'POST', headers: h, body: JSON.stringify(body || {}) });
+      if (r.ok) return { json: await r.json(), via: t ? 'CSRF token' : '无 token' };
+      lastErr = new Error('HTTP ' + r.status
+        + (r.status === 403 ? '（403＝CSRF 校验未通过：已试 ' + tries.length + ' 个 token 来源均被拒；'
+            + '可在 ST 设置里临时关闭 CSRF 保护，或在下方手动指定世界书名后重试）' : ''));
+      if (r.status !== 403) break;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('请求失败');
+}
+
+/* 列出所有世界书名：自动探测拿不到名字时的兜底 */
+async function wbListNames() {
+  try {
+    const { json } = await stPost('/api/worldinfo/list', {});
+    const pool = [];
+    const walk = (v, d) => {
+      if (v == null || d > 4) return;
+      if (typeof v === 'string') { pool.push(v); return; }
+      if (Array.isArray(v)) { for (const x of v) walk(x, d + 1); return; }
+      if (typeof v === 'object') {
+        if (typeof v.name === 'string') pool.push(v.name);
+        for (const k of Object.keys(v)) walk(v[k], d + 1);
+      }
+    };
+    walk(json, 0);
+    return Array.from(new Set(pool.filter(s => s && !/^\d+$/.test(String(s)))));
+  } catch (e) { return []; }
+}
+
 async function wbFetch(name) {
-  const r = await fetch('/api/worldinfo/get', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
-  });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  const j = await r.json();
+  const { json: j } = await stPost('/api/worldinfo/get', { name });
   /* 不猜固定层级：递归找出第一个形态像条目集合的对象 */
   const arr = normalizeEntries(j);
   if (!arr.length) throw new Error('返回里没找到条目（结构: ' + Object.keys(j || {}).join(',') + '）');
@@ -2245,17 +2294,9 @@ async function wbFetch(name) {
 async function wbWriteBack(name, entries) {
   const dict = toEntriesDict(entries);
   const body = { name, data: { entries: dict } };
-  const r = await fetch('/api/worldinfo/edit', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) {
-    let msg = 'HTTP ' + r.status;
-    try { const t = await r.text(); if (t) msg += ' ' + String(t).slice(0, 120); } catch (e) { /* 忽略 */ }
-    throw new Error(msg);
-  }
-  return true;
+  const { json, via } = await stPost('/api/worldinfo/edit', body);
+  wbWriteBack.lastVia = via || '';
+  return json !== undefined;
 }
 
 /* 持久化：ST 各版本的保存函数挂载点不一，逐个试 */
@@ -2309,14 +2350,26 @@ async function wbProbe(force, opt) {
   const live = wbReadLive();
   if (live) { entries = live.entries; src = live.src; }
   else {
-    const nm = wbCurrentName();
+    let nm = wbCurrentName();
     if (!nm) {
-      out.err = '读不到世界书：context 里没有条目，也拿不到世界书名字。'
-        + '请在下方「世界书名（手动指定）」里填上，例如 "HP贵族"。';
-      __wbProbe = out; return out;
+      const ns = await wbListNames();
+      if (ns.length === 1) nm = ns[0];
+      if (!nm) {
+        out.names = ns;
+        out.err = '读不到世界书：context 里没有条目，也拿不到世界书名字。'
+          + (ns.length ? '检测到这些世界书：' + ns.slice(0, 8).join(' / ') + '——把其中一个填进下方「世界书名（手动指定）」。'
+                      : '请在下方「世界书名（手动指定）」里填上，例如 "HP贵族"。');
+        __wbProbe = out; return out;
+      }
     }
     try { entries = await wbFetch(nm); src = 'api:/worldinfo/get'; out.name = nm; }
-    catch (e) { out.err = '读取失败：' + e.message + '（世界书名：' + nm + '）'; __wbProbe = out; return out; }
+    catch (e) {
+      const ns = await wbListNames();
+      out.names = ns;
+      out.err = '读取失败：' + e.message + '（世界书名：' + nm + '）'
+        + (ns.length && !ns.includes(nm) ? '。检测到可用的世界书：' + ns.slice(0, 8).join(' / ') : '');
+      __wbProbe = out; return out;
+    }
   }
   if (!entries || !entries.length) { out.err = '世界书里没有条目'; __wbProbe = out; return out; }
   out.ok = true; out.count = entries.length; out.src = src;
@@ -4348,6 +4401,36 @@ function throttled(key, ms) {
   return true;
 }
 
+/* 【修 v1.29】重建 API 行并还原焦点与光标位置，避免"打一个字就得重新点输入框" */
+function rebuildApiBody(host, apiIdx, field) {
+  try {
+    const pane = host && host.querySelector ? host.querySelector('#hp-pane-host') : null;
+    if (!pane) return;
+    const old = Array.from(pane.querySelectorAll('[data-api]'))
+      .find(x => x.dataset.api === String(apiIdx) && x.dataset.f === field);
+    const pos = old ? old.selectionStart : null;
+    const body = pane.querySelector('#hp-api-body');
+    if (!body) return;
+    body.innerHTML = apiRowsHTML();
+    bindPane(host);
+    const now = Array.from(pane.querySelectorAll('[data-api]'))
+      .find(x => x.dataset.api === String(apiIdx) && x.dataset.f === field);
+    if (now) {
+      now.focus();
+      try { if (pos != null) now.setSelectionRange(pos, pos); } catch (e) { /* 忽略 */ }
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+/* 后端地址/令牌改动后重探测：去抖，避免每敲一个字符发一次请求 */
+let __memProbeT = null;
+function scheduleMemProbe() {
+  try { clearTimeout(__memProbeT); } catch (e) { /* 忽略 */ }
+  __memProbeT = setTimeout(() => {
+    try { memProbe(true).then(() => memPanePaint()).catch(() => {}); } catch (e) { /* 忽略 */ }
+  }, 600);
+}
+
 /* 【修 v1.9】绑定标记：同一个元素只绑一次，杜绝 bindPane 反复调用导致的叠加。
    pane 每次换面板会整体重绘，用 pane 上的版本号区分即可。 */
 let __bindSeq = 0;
@@ -4379,7 +4462,7 @@ function bindPane(host) {
     const commit = () => {
       settings[el.dataset.str] = el.value;
       // 地址/令牌改了 → 重新检测
-      if (el.dataset.str === 'memBase' || el.dataset.str === 'memToken') memProbe(true).then(() => memPanePaint());
+      if (el.dataset.str === 'memBase' || el.dataset.str === 'memToken') scheduleMemProbe();
     };
     onEv(el, 'input', () => { commit(); schedulePersist(); });
     onEv(el, 'change', () => { commit(); saveSettings(); });
@@ -4441,13 +4524,14 @@ function bindPane(host) {
       settings.apis[i] = settings.apis[i] || {};
       settings.apis[i][f] = (f === 'rpm' || f === 'concurrency') ? Number(el.value) : el.value;
       schedulePersist();
-      if (f === 'name') {
-        const body = pane.querySelector('#hp-api-body');
-        if (body) { body.innerHTML = apiRowsHTML(); bindPane(host); }
-      }
     };
     onEv(el, 'input', commit);
-    onEv(el, 'change', () => { commit(); saveSettings(); });
+    onEv(el, 'change', () => {
+      commit(); saveSettings();
+      /* 【修 v1.29】名字要同步进下拉框，必须重建——但只在失焦时建，建完把光标还回去。
+         原逻辑每敲一个字符就重建整块 DOM，正在打字的 input 当场被销毁 → 焦点丢失。 */
+      if (el.dataset.f === 'name') rebuildApiBody(host, el.dataset.api, 'name');
+    });
   });
   onEv(pane.querySelector('#hp-api-add'), 'click', () => {
     if (!throttled('api-add', 500)) return;
@@ -5621,6 +5705,41 @@ function showChapterModal(c) {
 
 
 /* ---------- 【v1.20】记忆图谱可视化（Canvas 力导向 · 常显 · 美化） ---------- */
+/* 【v1.29 美化工具】hex → rgba / 提亮 / 圆角矩形 */
+function hexA(hex, a) {
+  try {
+    let h = String(hex || '').trim();
+    if (h.startsWith('rgba') || h.startsWith('rgb')) return h;
+    if (h.startsWith('#')) h = h.slice(1);
+    if (h.length === 3) h = h.split('').map(c => c + c).join('');
+    const n = parseInt(h, 16);
+    if (!Number.isFinite(n)) return 'rgba(143,182,216,' + a + ')';
+    return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+  } catch (e) { return 'rgba(143,182,216,' + a + ')'; }
+}
+function lighten(hex, t) {
+  try {
+    let h = String(hex || '').trim();
+    if (h.startsWith('#')) h = h.slice(1);
+    if (h.length === 3) h = h.split('').map(c => c + c).join('');
+    const n = parseInt(h, 16);
+    if (!Number.isFinite(n)) return hex;
+    const r = Math.min(255, Math.round(((n >> 16) & 255) + (255 - ((n >> 16) & 255)) * t));
+    const g = Math.min(255, Math.round(((n >> 8) & 255) + (255 - ((n >> 8) & 255)) * t));
+    const b = Math.min(255, Math.round((n & 255) + (255 - (n & 255)) * t));
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  } catch (e) { return hex; }
+}
+function roundRect(ctx, x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
 async function memFetchGraph(limit) {
   try {
     const j = await memFetch('/graph?limit=' + (limit || 400));
@@ -5657,13 +5776,16 @@ function showMemoryGraph() {
         <span class="hp-sp"></span>
         <input id="hp-gfind" class="hp-inp hp-gfind" placeholder="找实体…">
         <button class="hp-mini" id="hp-gseed">场景扩散</button>
+        <button class="hp-mini" id="hp-grelayout">重排</button>
         <button class="hp-mini" id="hp-gretry">重连</button>
-        <button class="hp-chx">✕</button>
+        <button class="hp-mini" id="hp-gfull" title="展开到全屏">⛶ 展开</button>
+        <button class="hp-chx" id="hp-gclose" title="关闭">✕</button>
       </div>
       <div class="hp-chbody" style="padding:0;position:relative;overflow:hidden">
         <canvas id="hp-gcanvas"></canvas>
         <div id="hp-gempty" class="hp-gempty" style="display:none"></div>
         <div id="hp-gtip" class="hp-gtip"></div>
+        <button class="hp-gfab" id="hp-gfab" title="展开到全屏" aria-label="展开到全屏">⛶</button>
         <div class="hp-glegend">
           <span><i style="background:#f2c14e"></i>人物</span>
           <span><i style="background:#4fd0c0"></i>地点</span>
@@ -5687,8 +5809,20 @@ function showMemoryGraph() {
   const close = () => { if (raf) cancelAnimationFrame(raf); wrap.remove(); };
   wrap.querySelector('.hp-chx').onclick = close;
   wrap.querySelector('.hp-chmask').onclick = close;
-  const onKey = e => { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', onKey); } };
+  const onKey = e => {
+    if (e.key !== 'Escape') return;
+    if (wrap.classList.contains('full')) { setFull(false); return; }
+    close(); document.removeEventListener('keydown', onKey);
+  };
   document.addEventListener('keydown', onKey);
+
+  /* ---- 全屏展开 ---- */
+  function setFull(on) {
+    wrap.classList.toggle('full', !!on);
+    const b = wrap.querySelector('#hp-gfull');
+    if (b) b.textContent = on ? '⤡ 收起' : '⛶ 展开';
+    setTimeout(() => { layout(); if (nodes.length) reheat(0.45); }, 40);
+  }
 
   /* ---- 尺寸：挂 html 上 + px 写死，绕开 body transform 导致的 fixed 错位 ---- */
   function layout() {
@@ -5704,10 +5838,20 @@ function showMemoryGraph() {
     W = Math.max(120, r.width); H = Math.max(120, r.height);
     dpr = Math.min(2.5, window.devicePixelRatio || 1);
     cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
-    if (nodes.length) { settled = false; steps = 0; }
+    /* 【修 v1.29】不在这里无条件复位：手机上地址栏收放、软键盘弹出都会狂发 resize，
+       一 resize 就复位 steps → 永远收敛不了 → 节点一直乱动。 */
   }
   requestAnimationFrame(layout);
-  addEventListener('resize', () => { layout(); }, { passive: true });
+  /* resize 去抖 180ms，且只有尺寸真变了（>8px）才重排 */
+  let __rzT = null;
+  addEventListener('resize', () => {
+    if (__rzT) clearTimeout(__rzT);
+    __rzT = setTimeout(() => {
+      const ow = W, oh = H;
+      layout();
+      if (nodes.length && (Math.abs(W - ow) > 8 || Math.abs(H - oh) > 8)) reheat(0.5);
+    }, 180);
+  }, { passive: true });
 
   /* ---- 加载：区分「未连接 / 已连接但为空 / 有数据」三种状态 ---- */
   async function load(again) {
@@ -5773,13 +5917,20 @@ function showMemoryGraph() {
     stat.className = 'hp-gstat good';
     stat.textContent = `● 已连接 · ${nodes.length} 实体 · ${edges.length} 关系`
       + (g.truncated ? '（已截断，可调上限）' : '');
-    settled = false; steps = 0; view = { x: 0, y: 0, k: 1 };
+    alpha = 1; steps = 0; settled = false; view = { x: 0, y: 0, k: 1 };
     loop();
   }
 
-  /* ---- 力导向：空间网格加速斥力，收敛后自动停步 ---- */
+  /* ---- 力导向：空间网格加速斥力 + alpha 冷却，收敛即停 ---- */
+  let alpha = 1;
+  function reheat(a) {
+    alpha = a == null ? 0.55 : a;
+    steps = 0; settled = false;
+    loop();
+  }
   function step() {
-    const K = 46, DAMP = 0.86, CELL = 90;
+    const K = 46, DAMP = 0.82, CELL = 90;
+    alpha *= 0.975;
     const grid = new Map();
     const key = (cx, cy) => cx * 100000 + cy;
     for (const n of nodes) {
@@ -5799,7 +5950,7 @@ function showMemoryGraph() {
           let d2 = ex * ex + ey * ey;
           if (d2 > CELL * CELL * 2.25) continue;
           if (d2 < 1) { d2 = 1; ex = (Math.random() - .5); ey = (Math.random() - .5); }
-          const d = Math.sqrt(d2), f = (K * K) / d2;
+          const d = Math.sqrt(d2), f = (K * K) / d2 * alpha;
           const fx = (ex / d) * f, fy = (ey / d) * f;
           n.vx -= fx; n.vy -= fy; m.vx += fx; m.vy += fy;
         }
@@ -5810,14 +5961,14 @@ function showMemoryGraph() {
       if (!a || !b) continue;
       const dx = b.x - a.x, dy = b.y - a.y;
       const d = Math.sqrt(dx * dx + dy * dy) || 1;
-      const f = (d - K) * 0.02 * Math.min(3, e.w || 1);
+      const f = (d - K) * 0.02 * Math.min(3, e.w || 1) * alpha;
       const fx = (dx / d) * f, fy = (dy / d) * f;
       a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
     }
     let energy = 0;
     for (const n of nodes) {
-      n.vx += (W / 2 - n.x) * 0.004;
-      n.vy += (H / 2 - n.y) * 0.004;
+      n.vx += (W / 2 - n.x) * 0.004 * alpha;
+      n.vy += (H / 2 - n.y) * 0.004 * alpha;
       n.vx *= DAMP; n.vy *= DAMP;
       n.x += n.vx; n.y += n.vy;
       n.x = Math.max(n.r + 2, Math.min(W - n.r - 2, n.x));
@@ -5825,8 +5976,10 @@ function showMemoryGraph() {
       energy += Math.abs(n.vx) + Math.abs(n.vy);
     }
     steps++;
-    if (steps > 12 && energy / Math.max(1, nodes.length) < 0.06) settled = true;
-    if (steps > 400) settled = true;
+    /* 【修 v1.29】以 alpha 冷却为主判据：约 150 步内收敛，硬上限 320 步兜底。
+       旧判据要求平均速度 <0.06px/帧，101 个节点挤在小画布里永远达不到，
+       只能靠 400 步硬顶，而 resize 又会不断把 steps 清零 → 永久抖动。 */
+    if (alpha < 0.035 || steps > 320) settled = true;
   }
 
   function draw() {
@@ -5834,11 +5987,21 @@ function showMemoryGraph() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     // 背景：暗底 + 中心微光
     ctx.clearRect(0, 0, W, H);
-    const rg = ctx.createRadialGradient(W / 2, H * 0.44, 0, W / 2, H * 0.44, Math.max(W, H) * 0.66);
-    rg.addColorStop(0, 'rgba(126,196,168,.10)');
-    rg.addColorStop(0.55, 'rgba(60,96,150,.05)');
+    const bg = ctx.createLinearGradient(0, 0, W, H);
+    bg.addColorStop(0, '#0b1017'); bg.addColorStop(0.5, '#0e141d'); bg.addColorStop(1, '#090d13');
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+    const rg = ctx.createRadialGradient(W / 2, H * 0.42, 0, W / 2, H * 0.42, Math.max(W, H) * 0.72);
+    rg.addColorStop(0, 'rgba(126,196,168,.13)');
+    rg.addColorStop(0.5, 'rgba(58,96,150,.07)');
     rg.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = rg; ctx.fillRect(0, 0, W, H);
+    ctx.save(); ctx.globalAlpha = 0.055; ctx.fillStyle = '#9fc4e4';
+    const gap = 34;
+    for (let gx = gap; gx < W; gx += gap) for (let gy = gap; gy < H; gy += gap) ctx.fillRect(gx, gy, 1, 1);
+    ctx.restore();
+    const vg = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.34, W / 2, H / 2, Math.max(W, H) * 0.8);
+    vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,.5)');
+    ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
 
     ctx.save();
     ctx.translate(W / 2, H / 2); ctx.scale(view.k, view.k); ctx.translate(-W / 2 + view.x, -H / 2 + view.y);
@@ -5849,8 +6012,15 @@ function showMemoryGraph() {
       if (!a || !b) continue;
       const on = sel && (e.a === sel || e.b === sel);
       const w = Math.min(3, e.w || 1);
-      ctx.strokeStyle = on ? 'rgba(242,193,78,.55)' : `rgba(120,160,210,${0.09 + w * 0.05})`;
-      ctx.lineWidth = on ? 1.5 : 0.6 + w * 0.25;
+      if (on) {
+        ctx.strokeStyle = 'rgba(242,193,78,.62)';
+      } else {
+        const lg = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+        lg.addColorStop(0, hexA((a.col && a.col[0]) || '#8fb6d8', 0.10 + w * 0.07));
+        lg.addColorStop(1, hexA((b.col && b.col[0]) || '#8fb6d8', 0.10 + w * 0.07));
+        ctx.strokeStyle = lg;
+      }
+      ctx.lineWidth = on ? 1.5 : 0.6 + w * 0.22;
       const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
       const nx = -(b.y - a.y), ny = (b.x - a.x);
       const len = Math.hypot(nx, ny) || 1;
@@ -5859,7 +6029,8 @@ function showMemoryGraph() {
       ctx.stroke();
     }
 
-    // 节点：径向渐变 + 光晕；选中态放大并描边
+    // 节点：外圈柔光 + 渐变球体 + 描边；标签防重叠
+    const placed = [];
     for (const n of nodes) {
       const hot = sel && (n.id === sel || (selLinks && selLinks.has(n.id)));
       const r = n.r * (hot ? 1.25 : 1);
@@ -5867,37 +6038,53 @@ function showMemoryGraph() {
       if (hot) {
         ctx.shadowColor = c1; ctx.shadowBlur = 16;
       }
+      const hg = ctx.createRadialGradient(n.x, n.y, r * 0.7, n.x, n.y, r * 2.15);
+      hg.addColorStop(0, hexA(c1, hot ? 0.34 : 0.15));
+      hg.addColorStop(1, hexA(c1, 0));
+      ctx.beginPath(); ctx.arc(n.x, n.y, r * 2.15, 0, Math.PI * 2);
+      ctx.fillStyle = hg; ctx.fill();
       const g = ctx.createRadialGradient(n.x - r * .35, n.y - r * .4, r * .1, n.x, n.y, r);
-      g.addColorStop(0, c1); g.addColorStop(1, c2);
+      g.addColorStop(0, lighten(c1, 0.3)); g.addColorStop(1, c2);
       ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
       ctx.fillStyle = g; ctx.fill();
       ctx.shadowBlur = 0;
-      ctx.lineWidth = hot ? 1.6 : 0.8;
-      ctx.strokeStyle = hot ? '#fff' : 'rgba(255,255,255,.22)';
+      ctx.lineWidth = hot ? 1.8 : 0.9;
+      ctx.strokeStyle = hot ? '#ffffff' : hexA('#ffffff', 0.26);
       ctx.stroke();
 
       const showLabel = r > 8 || hot || view.k > 1.4;
       if (showLabel) {
         const fs = Math.max(9.5, Math.min(13, 9.5 + (n.deg ? Math.sqrt(n.deg) * 0.9 : 0)));
-        ctx.font = `${hot ? 600 : 400} ${fs}px system-ui,-apple-system,sans-serif`;
+        ctx.font = `${hot ? 600 : 500} ${fs}px system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif`;
         ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-        ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(6,9,13,.92)';
-        ctx.strokeText(n.name, n.x, n.y + r + 3);
-        ctx.fillStyle = hot ? '#fff' : 'rgba(214,228,242,.82)';
-        ctx.fillText(n.name, n.x, n.y + r + 3);
+        const tw = ctx.measureText(n.name).width;
+        const lx = n.x, ly = n.y + r + 3;
+        const bx = [lx - tw / 2 - 3, ly - 2, lx + tw / 2 + 3, ly + fs + 4];
+        const clash = placed.some(p => !(bx[2] < p[0] || bx[0] > p[2] || bx[3] < p[1] || bx[1] > p[3]));
+        if (clash && !hot && view.k <= 1.4) continue;
+        placed.push(bx);
+        if (hot || view.k > 1.4) {
+          ctx.fillStyle = 'rgba(8,12,18,.8)';
+          roundRect(ctx, bx[0], bx[1], bx[2] - bx[0], bx[3] - bx[1], 4); ctx.fill();
+        }
+        ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(6,9,13,.9)';
+        ctx.strokeText(n.name, lx, ly);
+        ctx.fillStyle = hot ? '#ffffff' : 'rgba(220,232,246,.9)';
+        ctx.fillText(n.name, lx, ly);
       }
     }
     ctx.restore();
   }
 
   function loop() {
-    if (raf) cancelAnimationFrame(raf);
+    if (raf) { cancelAnimationFrame(raf); raf = null; }
+    if (settled) { draw(); return; }   /* 【修 v1.29】收敛后彻底停掉 RAF，不再空转 60fps */
     const tick = () => {
-      if (!settled) step();
-      draw();
+      if (settled) { draw(); raf = null; return; }
+      step(); draw();
       raf = requestAnimationFrame(tick);
     };
-    tick();
+    raf = requestAnimationFrame(tick);
   }
 
   /* ---- 交互：悬停 / 点选 / 拖拽 / 滚轮缩放 / 平移 ---- */
@@ -5917,7 +6104,7 @@ function showMemoryGraph() {
   cv.addEventListener('mousemove', ev => {
     const r = cv.getBoundingClientRect();
     const mx = ev.clientX - r.left, my = ev.clientY - r.top;
-    if (drag) { const p = toWorld(mx, my); drag.x = p.x; drag.y = p.y; drag.vx = drag.vy = 0; settled = false; steps = 0; return; }
+    if (drag) { const p = toWorld(mx, my); drag.x = p.x; drag.y = p.y; drag.vx = drag.vy = 0; reheat(0.35); return; }
     if (panning) { view.x += (mx - panning.x) / view.k; view.y += (my - panning.y) / view.k; panning = { x: mx, y: my }; return; }
     const hit = pick(mx, my);
     if (!hit) { tip.style.display = 'none'; sel = null; selLinks = null; return; }
@@ -5973,6 +6160,23 @@ function showMemoryGraph() {
   };
   const retryBtn = wrap.querySelector('#hp-gretry');
   if (retryBtn) retryBtn.onclick = () => load(true);
+  const fullBtn = wrap.querySelector('#hp-gfull');
+  const fabBtn = wrap.querySelector('#hp-gfab');
+  if (fullBtn) fullBtn.onclick = () => setFull(!wrap.classList.contains('full'));
+  if (fabBtn) fabBtn.onclick = () => setFull(true);
+  const relayoutBtn = wrap.querySelector('#hp-grelayout');
+  if (relayoutBtn) relayoutBtn.onclick = () => {
+    if (!nodes.length) return;
+    const R = Math.min(W, H) * 0.34;
+    nodes.forEach((n, i) => {
+      const a = (i / nodes.length) * Math.PI * 2;
+      n.x = W / 2 + Math.cos(a) * R + (Math.random() - .5) * 8;
+      n.y = H / 2 + Math.sin(a) * R + (Math.random() - .5) * 8;
+      n.vx = 0; n.vy = 0;
+    });
+    view = { x: 0, y: 0, k: 1 };
+    reheat(1);
+  };
 
   load(false);
 }

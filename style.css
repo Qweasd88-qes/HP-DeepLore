@@ -935,3 +935,52 @@
   .hp-preview-body{max-height:52vh}
   .hp-scan{width:calc(100vw - 24px)!important;left:12px!important}
 }
+
+
+/* ===== v1.29 记忆图谱：全屏展开 + 悬浮展开键 + 美化 ===== */
+#hp-graph-modal.full .hp-chmask{background:rgba(3,6,10,.88);backdrop-filter:blur(4px)}
+#hp-graph-modal.full .hp-gbox{
+  width:100vw!important;height:100vh!important;left:0!important;top:0!important;
+  max-width:none!important;border-radius:0!important;border:none!important;
+  box-shadow:none!important;
+}
+#hp-graph-modal.full .hp-chtop{border-radius:0;background:rgba(12,17,24,.96)}
+#hp-graph-modal.full .hp-gstat{max-width:none}
+.hp-gfab{
+  position:absolute;left:50%;bottom:14px;transform:translateX(-50%);z-index:7;
+  width:46px;height:46px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-size:19px;line-height:1;color:#d6f0e4;cursor:pointer;
+  background:linear-gradient(180deg,rgba(126,196,168,.30),rgba(126,196,168,.10));
+  border:1px solid rgba(126,196,168,.55);
+  box-shadow:0 8px 22px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.06) inset;
+  backdrop-filter:blur(6px);
+}
+.hp-gfab:active{transform:translateX(-50%) scale(.93)}
+#hp-graph-modal.full .hp-gfab{display:none}
+#hp-graph-modal .hp-gbox{border:1px solid rgba(126,196,168,.22);box-shadow:0 20px 64px rgba(0,0,0,.66),0 0 0 1px rgba(126,196,168,.10)}
+#hp-graph-modal .hp-chtop{
+  background:linear-gradient(180deg,rgba(20,27,36,.98),rgba(14,19,26,.98));
+  border-bottom:1px solid rgba(126,196,168,.16);
+}
+#hp-graph-modal .hp-mini{
+  border:1px solid rgba(126,196,168,.34)!important;color:#cfe9dc!important;
+  background:rgba(126,196,168,.10)!important;border-radius:7px!important;
+  padding:3px 9px!important;font-size:11.5px!important;
+}
+#hp-graph-modal .hp-mini:hover{background:rgba(126,196,168,.2)!important}
+#hp-graph-modal .hp-chx{
+  color:#e8b0a0!important;border-color:rgba(232,138,138,.4)!important;
+  background:rgba(232,138,138,.12)!important;border-radius:7px!important;
+}
+#hp-graph-modal .hp-glegend{
+  background:rgba(10,14,20,.78)!important;border:1px solid rgba(126,196,168,.16)!important;
+  border-radius:9px!important;backdrop-filter:blur(6px);padding:6px 10px!important;
+}
+#hp-graph-modal .hp-gtip{
+  background:rgba(10,14,20,.94)!important;border:1px solid rgba(126,196,168,.3)!important;
+  border-radius:8px!important;box-shadow:0 8px 20px rgba(0,0,0,.55)!important;
+}
+#hp-graph-modal .hp-gfind{
+  border:1px solid rgba(126,196,168,.3)!important;border-radius:7px!important;
+  background:rgba(8,12,18,.7)!important;color:#dfeaf3!important;
+}
