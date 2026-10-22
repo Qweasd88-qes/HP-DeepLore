@@ -206,7 +206,7 @@ function stEventTypes() {
 }
 
 const EXT_ID = 'hp-deeplore';
-const EXT_VER = 'v1.25.0';
+const EXT_VER = 'v1.26.0';
 const EXT_NAME = 'HP DeepLore';
 const DB_NAME = 'hp_deeplore';
 const DB_VER = 1;
@@ -1988,15 +1988,77 @@ function wbReadLive() {
   return null;
 }
 
-/* 当前世界书名字 */
+/* 【修 v1.26】Slash 命令层。
+   有些 ST 版本里 context 拿不到 worldInfo、/worldinfo/get 也读不通，
+   但原生 UI 的斜杠命令一定可用——它走的是 ST 自己的内部通道，最贴近手动操作。
+   这里把命令解析封装起来，并做成"探测 + 多格式尝试 + 结果验证"，不硬编码赌一种写法。 */
+function wbSlash() {
+  const S = ST();
+  return S.SlashCommandParser || (typeof window !== 'undefined' ? window.SlashCommandParser : null) || null;
+}
+async function wbSlashRun(cmd) {
+  const P = wbSlash();
+  if (!P) return { ok: false, err: 'SlashCommandParser 不存在' };
+  try {
+    if (typeof P.parse === 'function') await P.parse(cmd);
+    else if (typeof P.execute === 'function') await P.execute(cmd);
+    else return { ok: false, err: '解析器没有 parse/execute' };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, err: String(e?.message || e) };
+  }
+}
+/* 探测可用命令，重点看有没有 world / enable / disable 相关的 */
+function wbSlashProbe() {
+  const P = wbSlash();
+  const out = { has: false, total: 0, world: [], entryCmd: false, err: '' };
+  if (!P) { out.err = 'SlashCommandParser 不存在'; return out; }
+  out.has = true;
+  let cmds = [];
+  try {
+    const src = P.commands || P.slashCommands || (typeof P.getCommands === 'function' ? P.getCommands() : null);
+    if (src) {
+      /* 用鸭子类型判断，不用 instanceof Map —— 跨 realm（iframe/沙盒）时 instanceof 会失效 */
+      const looksMap = typeof src.keys === 'function' && typeof src.get === 'function';
+      if (looksMap) { try { cmds = [...src.keys()]; } catch (e) { cmds = []; } }
+      else if (typeof src.forEach === 'function' && !Array.isArray(src)) {
+        try { src.forEach((v, k) => cmds.push(String(k))); } catch (e) { /* 忽略 */ }
+      }
+      else if (Array.isArray(src)) cmds = src.map(x => (x && (x.name || x.key)) ? String(x.name || x.key) : String(x));
+      else if (typeof src === 'object') cmds = Object.keys(src);
+    }
+  } catch (e) { /* 某些版本不可枚举，退回黑名单试跑 */ }
+  out.total = cmds.length;
+  out.world = cmds.filter(c => /world|enable|disable/i.test(String(c))).slice(0, 30);
+  /* 单条启停命令：ST 会为每个条目注册 enable-<名>/disable-<名> */
+  out.entryCmd = out.world.some(c => /^(enable|disable)-/.test(String(c)));
+  if (!out.total) out.err = '拿不到命令表（可枚举性受限），将用试跑探测';
+  return out;
+}
+
+/* 当前世界书名字（多路径，含 DOM 兜底） */
 function wbCurrentName() {
   try {
     const c = stGetContext() || {};
-    const n = c.worldInfoName || c.world_info_name || c.worldInfo?.name
+    const n = c.worldInfoName || c.world_info_name || c.worldInfo?.name || c.world_info?.name
       || (typeof c.getWorldInfoName === 'function' ? c.getWorldInfoName() : null);
     if (n) return String(n);
     const S = ST();
-    if (S.getCurrentWorldInfoName) return String(S.getCurrentWorldInfoName() || '') || null;
+    if (typeof S.getCurrentWorldInfoName === 'function') {
+      const g = String(S.getCurrentWorldInfoName() || '');
+      if (g) return g;
+    }
+    /* DOM 兜底：世界书下拉框 / 编辑器选择框 */
+    try {
+      const sel = document.querySelector('#world_info_select, #world_editor_select, .world_info_select, select#world_info');
+      const v = sel && (sel.value || (sel.options && sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]?.text));
+      if (v && String(v).trim() && !/^(select|选择)/i.test(String(v))) return String(v).trim();
+    } catch (e) { /* 忽略 */ }
+    /* 全局兜底 */
+    if (typeof window !== 'undefined') {
+      const w = window.world_info_name || window.worldInfoName || window.currentWorldInfoName;
+      if (w) return String(w);
+    }
   } catch (e) { /* 忽略 */ }
   return null;
 }
@@ -2034,10 +2096,13 @@ function isPlotEntry(e) {
   return /\[Y\d-\d{3}\]/.test(cm) && /第\d+章/.test(cm);
 }
 function entryChapter(e) {
+  /* 优先读 comment 里明写的「第N章」——那是显式章号，不依赖 uid 基准约定。
+     uid 只在没有文字章号时作回退（900000 → 第1章）。 */
+  const m = /第(\d+)章/.exec(String(e?.comment || e?.name || ''));
+  if (m) { const n = Number(m[1]); if (n >= 1 && n <= 9999) return n; }
   const uid = Number(e?.uid);
   if (Number.isFinite(uid) && uid >= PLOT_UID_BASE && uid <= PLOT_UID_BASE + 999) return uid - PLOT_UID_BASE + 1;
-  const m = /第(\d+)章/.exec(String(e?.comment || ''));
-  return m ? Number(m[1]) : null;
+  return null;
 }
 
 /* 读一次世界书并探测写入能力，结果缓存 30 秒 */
@@ -2078,21 +2143,79 @@ async function wbApplyChapter(ch, range) {
     const ec = entryChapter(e);
     if (ec == null) continue;
     const want = (ec >= lo && ec <= hi) ? false : true;   // disable: 范围内=false(启用)
-    if (!!e.disable !== want) { e.disable = want; changed.push({ ch: ec, disable: want }); }
+    if (!!e.disable !== want) { e.disable = want; changed.push({ ch: ec, disable: want, e }); }
   }
-  /* 写回：优先 context 直改（ST 会随下次保存落盘），再试 API */
-  let ok = false, src = '';
+  /* 写回。三条路依次试，任一成功即止：
+     ① context 内存直改 —— 最快，但需 ST 自己保存才持久
+     ② /worldinfo/edit API —— 标准后端写入
+     ③ Slash 命令 —— 走 ST 原生 UI 通道，对读不通 context 的版本有效 */
+  let ok = false, src = ''; const tried = [];
+
+  /* ① context 内存：改得到 ≠ 存得住。只改内存而 ST 没保存，等于没改。 */
+  let memOk = false, apiOk = false, saved = false;
+  if (live) memOk = true;
+  /* ② API（真正落盘，优先于内存） */
   try {
     const nm = wbCurrentName() || p.name;
-    if (nm) { ok = await wbWriteBack(nm, entries); src = 'api:/worldinfo/edit'; }
-  } catch (e) { /* 落到下面 */ }
-  if (!ok && live) { ok = true; src = 'context 内存（需 ST 自行保存才持久）'; }
-  /* 若 ST 有现成保存函数，调一次让它落盘 */
+    if (nm) { apiOk = await wbWriteBack(nm, entries); if (!apiOk) tried.push('API 返回非 200'); }
+    else tried.push('拿不到世界书名字');
+  } catch (e) { tried.push('API:' + e.message); }
+  /* ③ 落盘：ST 有现成保存函数就调一次 */
   try {
     const c = stGetContext();
-    if (typeof c?.saveWorldInfo === 'function') { await c.saveWorldInfo(); src += ' + saveWorldInfo'; }
+    if (typeof c?.saveWorldInfo === 'function') { await c.saveWorldInfo(); saved = true; }
   } catch (e) { /* 忽略 */ }
-  return { ok, changed: changed.length, list: changed, src, err: ok ? '' : '世界书写入不可用（需手动改条目启用状态）' };
+
+  /* 只有"API 成功"或"内存已改且确实存了"才算真成功，否则继续试 Slash */
+  ok = apiOk || (memOk && saved);
+  if (apiOk) src = 'api:/worldinfo/edit';
+  else if (ok) src = 'context 内存 + saveWorldInfo';
+
+  /* ③ Slash 命令逐条启停：只有前两条都失败时才走这条 */
+  let slashUsed = 0, slashErr = '';
+  if (!ok && changed.length) {
+    const sp = wbSlashProbe();
+    if (sp.has) {
+      for (const it of changed) {
+        const nm = entryName(it.e);
+        if (!nm) continue;
+        const r = await wbSlashSetEntry(nm, !it.disable);
+        if (r.ok) slashUsed++; else if (!slashErr) slashErr = r.err || '命令未生效';
+      }
+      if (slashUsed) { ok = true; src = (src ? src + ' + ' : '') + `Slash 命令(${slashUsed} 条)`; }
+    } else slashErr = sp.err;
+  }
+  /* 已经是目标状态、无需改动，也算成功 */
+  if (!ok && !changed.length && (live || p.ok)) {
+    return { ok: true, changed: 0, list: [], src: '无需改动（已是目标状态）', slash: 0, err: '' };
+  }
+  if (ok) return { ok: true, changed: changed.length, list: changed, src, slash: slashUsed, err: '' };
+  return {
+    ok: false, changed: 0, list: [], slash: 0, src,
+    err: '世界书写入不可用（试过：' + (tried.join('；') || '无可用路径') + (slashErr ? '；Slash:' + slashErr : '') + '）。请手动改条目启用状态。'
+  };
+}
+
+/* 条目名字（用于 Slash 命令） */
+function entryName(e) {
+  if (!e) return '';
+  /* 压平换行：条目名会拼进斜杠命令，带换行会把命令截断 */
+  return String(e.comment || e.name || e.entryName || e.key || '').replace(/[\r\n]+/g, ' ').trim();
+}
+/* 用 Slash 命令启停单条。多格式尝试，逐个试跑 */
+async function wbSlashSetEntry(name, enable) {
+  const safe = String(name || '').replace(/[\r\n]+/g, ' ').trim();
+  if (!safe) return { ok: false, err: '条目名为空' };
+  const forms = enable
+    ? [`/enable-${safe}`, `/world-enable ${safe}`, `/enable ${safe}`]
+    : [`/disable-${safe}`, `/world-disable ${safe}`, `/disable ${safe}`];
+  let last = '';
+  for (const f of forms) {
+    const r = await wbSlashRun(f);
+    if (r.ok) return { ok: true, cmd: f };
+    last = r.err || '';
+  }
+  return { ok: false, err: last || '命令未生效' };
 }
 
 /* ---------- 章节索引：从已建索引里聚合成「章号|日期|年级·分部」清单 ---------- */
@@ -4666,9 +4789,15 @@ function bindPane(host) {
     const out = pane.querySelector('#hp-plot-out');
     try {
       const p = await wbProbe(true);
+      const sp = wbSlashProbe();
+      const slashInfo = sp.has
+        ? `Slash 命令：可用（共 ${sp.total} 条）\n  相关命令：${sp.world.length ? sp.world.join('、') : '未能枚举'}\n  单条启停命令：${sp.entryCmd ? '有 ✓' : '未发现'}${sp.err ? '\n  （' + sp.err + '）' : ''}`
+        : `Slash 命令：不可用（${sp.err}）`;
+      const nm = wbCurrentName();
+      const nameInfo = `世界书名：${nm || '拿不到 ← 这是读不通的主因'}`;
       out.textContent = p.ok
-        ? `世界书检测成功\n来源：${p.src}\n总条目：${p.count}\n剧情条目：${p.plotCount} 条${p.plotCount ? '（uid 900001 起，对应第 1 章）' : '（没找到 —— 确认 273 章剧情节点已导入世界书）'}`
-        : `检测失败：${p.err}\n\n若读不到，多半是当前 ST 版本没把条目挂在 context 上、也拿不到世界书名字。\n此时可手动：在世界书里按章节启用对应条目，插件的定位结果仍会显示在上方。`;
+        ? `世界书检测成功\n来源：${p.src}\n${nameInfo}\n总条目：${p.count}\n剧情条目：${p.plotCount} 条${p.plotCount ? '（uid 900001 起，对应第 1 章）' : '（没找到 —— 确认 273 章剧情节点已导入世界书）'}\n\n${slashInfo}`
+        : `检测失败：${p.err}\n\n${nameInfo}\n\n${slashInfo}\n\n排查顺序：\n1) 先在 ST 里打开一次世界书面板并选中一本（插件需要从下拉框读到名字）\n2) 确认世界书总开关是开着（可试 /world-on）\n3) 若条目能改但读不到列表，定位功能仍可用，只是无法自动启停`;
     } catch (e) { out.textContent = '检测出错：' + e.message; }
   });
 
@@ -6134,6 +6263,8 @@ function boot() {
         // v1.25 剧情进度控制
         wbProbe, wbApplyChapter, chapterIndexList, locateChapter, runPlotCtl,
         plotPaneHTML, isPlotEntry, entryChapter,
+        // v1.26 Slash 命令通道
+        wbSlashProbe, wbSlashRun, wbSlashSetEntry, wbCurrentName, entryName, wbReadLive,
       };
     } catch (e) { /* 忽略 */ }
     console.log('  · 菜单入口 : ' + (inMenu ? '✓ 已挂到魔法棒菜单' : '✗ 未找到菜单容器（已用悬浮球 ◈ 兜底）'));
