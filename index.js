@@ -79,22 +79,120 @@ function loadApisStandalone() {
   } catch (e) { return null; }
 }
 
-function writeLocalBackup() {
+/* 【修 v1.28】localStorage 可用性探针。
+   之前所有写入失败都被 catch 静默吞掉 —— 用户看到"刷新后配置全没"，
+   但代码里没有任何一处能证明到底写没写进去。先探测，再验证，最后报警。 */
+let __lsOk = null;
+function lsAvailable() {
+  if (__lsOk !== null) return __lsOk;
   try {
-    localStorage.setItem(LS_BACKUP, JSON.stringify(stExtensionSettings()[EXT_ID] || {}));
+    if (typeof localStorage === 'undefined' || !localStorage) { __lsOk = false; return false; }
+    const k = '__hp_ls_probe__';
+    localStorage.setItem(k, '1');
+    const ok = localStorage.getItem(k) === '1';
+    try { localStorage.removeItem(k); } catch (_) {}
+    __lsOk = ok;
+    return ok;
+  } catch (e) { __lsOk = false; return false; }
+}
+
+/* 【修 v1.28】写并读回校验。只 setItem 不校验，等于没证据。
+   返回 {ok, bytes, err}，失败原因要能传到面板上。 */
+function writeLocalBackup() {
+  if (!lsAvailable()) {
+    return { ok: false, bytes: 0, err: 'localStorage 不可用（隐私模式 / APP WebView 限制）' };
+  }
+  try {
+    /* 大字段剥离：nodeMap 已单独存 IndexedDB，没必要重复塞进 localStorage，
+       它最容易把备份撑到配额上限（setItem 会抛 QuotaExceededError） */
+    const src = stExtensionSettings()[EXT_ID] || {};
+    const slim = Object.assign({}, src);
+    delete slim.nodeMap;
+    const str = JSON.stringify(slim);
+    localStorage.setItem(LS_BACKUP, str);
+    const back = localStorage.getItem(LS_BACKUP);
+    if (back === null || back.length !== str.length) {
+      return { ok: false, bytes: 0, err: '写后读回不一致（配额不足或被清理）' };
+    }
+    __storeDiag.ls = { ok: true, bytes: str.length, t: Date.now(), err: '' };
+    return { ok: true, bytes: str.length, err: '' };
+  } catch (e) {
+    const msg = (e && e.name === 'QuotaExceededError')
+      ? 'localStorage 配额已满' : ((e && e.message) || String(e));
+    __storeDiag.ls = { ok: false, bytes: 0, t: Date.now(), err: msg };
+    console.warn('[HP-DeepLore] 本地备份写入失败：', msg);
+    return { ok: false, bytes: 0, err: msg };
+  }
+}
+
+/* 【修 v1.28】配置兜底存储（IndexedDB）。
+   localStorage 在部分手机 WebView / 隐私模式下会静默失效，而 IndexedDB 容量更大、
+   受"清除浏览数据"影响更小。这是配置不丢的最后一道防线。 */
+const __storeDiag = { ls: null, idb: null, st: null, lastSave: 0, lastErr: '' };
+/* 暴露到 window，方便在控制台直接看存储到底哪一环失败（__hpStoreDiag） */
+try { window.__hpStoreDiag = __storeDiag; } catch (e) {}
+
+async function idbSaveSettings() {
+  try {
+    const src = settings || {};
+    const slim = Object.assign({}, src);
+    delete slim.nodeMap;                      /* nodeMap 另有 store，不重复存 */
+    await idbSet(STORE.settings, 'main', { t: Date.now(), data: JSON.parse(JSON.stringify(slim)) });
+    __storeDiag.idb = { ok: true, t: Date.now(), err: '' };
     return true;
   } catch (e) {
-    console.warn('[HP-DeepLore] 本地备份写入失败：', e.message);
+    __storeDiag.idb = { ok: false, t: Date.now(), err: (e && e.message) || String(e) };
+    console.warn('[HP-DeepLore] IndexedDB 配置兜底写入失败：', e?.message || e);
     return false;
   }
+}
+async function idbLoadSettings() {
+  try {
+    const o = await idbGet(STORE.settings, 'main');
+    if (!o || typeof o !== 'object' || !o.data) return null;
+    return o;
+  } catch (e) { return null; }
+}
+
+/* 【修 v1.28】把一份存档并入当前 settings。
+   规则：谁的 __savedAt 新谁做基准；另一边只补"空"字段（空数组/空对象/空串都算空）。
+   这样既能救回 localStorage 失效时的配置，又不会让旧存档反向压掉新改动。 */
+function mergeSavedFrom(saved) {
+  try {
+    if (!saved || typeof saved !== 'object') return false;
+    const tCur = Number(settings && settings.__savedAt) || 0;
+    const tNew = Number(saved.__savedAt) || 0;
+    const isEmpty = v => v == null || v === ''
+      || (Array.isArray(v) && v.length === 0)
+      || (v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0);
+    if (tNew > tCur) {
+      /* 新存档更新：逐字段覆盖（但仍不让空值压掉现有非空值） */
+      for (const k of Object.keys(saved)) {
+        if (k === '__savedAt') { settings.__savedAt = saved.__savedAt; continue; }
+        if (isEmpty(saved[k]) && !isEmpty(settings[k])) continue;
+        settings[k] = saved[k];
+      }
+    } else {
+      /* 现有更新：只补空缺 */
+      for (const k of Object.keys(saved)) {
+        if (isEmpty(settings[k]) && !isEmpty(saved[k])) settings[k] = saved[k];
+      }
+    }
+    try { stExtensionSettings()[EXT_ID] = settings; } catch (e) {}
+    return true;
+  } catch (e) { return false; }
 }
 
 function stSaveSettings() {
   clearTimeout(__saveTimer);
   // 立即写本地备份，不等防抖
-  writeLocalBackup();
+  /* 【修 v1.28】这次也要记录失败原因：否则面板永远看不到"为什么没存住" */
+  const r0 = writeLocalBackup();
+  if (!r0 || !r0.ok) __storeDiag.lastErr = (r0 && r0.err) || '未知';
   __saveTimer = setTimeout(() => {
-    writeLocalBackup();
+    const r = writeLocalBackup();
+    if (!r.ok) { __storeDiag.lastErr = r.err; idbSaveSettings(); }
+    else idbSaveSettings();
     try {
       if (typeof window.saveSettingsDebounced === 'function') { window.saveSettingsDebounced(); return true; }
       const S = ST();
@@ -116,7 +214,10 @@ function flushSettings() {
     settings.__savedAt = Date.now();
     stExtensionSettings()[EXT_ID] = settings;
     saveApisNow();          /* 【修 v1.24】同步写，不等防抖 */
-    writeLocalBackup();
+    const rl = writeLocalBackup();
+    if (!rl.ok) __storeDiag.lastErr = rl.err;
+    idbSaveSettings();      /* 【修 v1.28】异步兜底，localStorage 挂了还有它 */
+    __storeDiag.lastSave = Date.now();
     const S = ST();
     if (typeof window.saveSettingsDebounced === 'function') { window.saveSettingsDebounced(); return true; }
     if (typeof S.saveSettingsDebounced === 'function') { S.saveSettingsDebounced(); return true; }
@@ -148,7 +249,10 @@ function syncInputsFromDOM(root) {
       if (dirty(el)) settings[el.dataset.num] = Number(el.value) || 0;
     });
     scope.querySelectorAll('[data-str]').forEach(el => {
-      if (dirty(el)) settings[el.dataset.str] = el.value;
+      /* 【修 v1.27】世界书名这类字段要 trim：肉眼看不见的首尾空格
+         会让 /worldinfo/get 精确匹配失败，且报错看不出原因 */
+      if (dirty(el)) settings[el.dataset.str] = (el.dataset.str === 'plotWorldbookName')
+        ? String(el.value || '').trim() : el.value;
     });
     /* 下拉框一律跳过：select 点选即触发 change，本就不会"未失焦丢失"；
        同步它的 value 反而会把渲染时不在 options 里的值写成空串，覆盖真实配置。 */
@@ -206,13 +310,14 @@ function stEventTypes() {
 }
 
 const EXT_ID = 'hp-deeplore';
-const EXT_VER = 'v1.26.0';
+const EXT_VER = 'v1.28.0';
 const EXT_NAME = 'HP DeepLore';
 const DB_NAME = 'hp_deeplore';
-const DB_VER = 1;
+const DB_VER = 2;   /* 【修 v1.28】+1：新增 settings store，用于配置兜底存储 */
 const STORE = {
   novel: 'novel', index: 'index', alias: 'alias', nodemap: 'nodemap',
   cache: 'cache', stats: 'stats', meta: 'meta',
+  settings: 'settings',   /* 【修 v1.28】配置兜底：localStorage 失效时的唯一退路 */
 };
 
 /* 年级映射：斯科皮比哈利低两级，1993 入学 = 一年级 */
@@ -294,6 +399,8 @@ const DEFAULTS = {
   plotRange: 1,            // 启用「当前章 ±N 章」，N=1 → 前一章/本章/下一章
   plotManualCh: 0,         // 手动指定章号，0=不指定（交给自动判定）
   plotTrustManual: false,  // true=手动值优先于自动判定
+  plotWorldbookName: '',   // 【v1.27】手动指定世界书名，自动探测失败时的唯一出路
+  plotVerify: true,        // 写入后重读一次，确认状态真的生效
   plotLastCh: 0,           // 上次定位结果
   plotLastWhy: '',
   plotLastAt: 0,
@@ -1963,27 +2070,79 @@ function fill(tpl, map) {
 /* ---------- 世界书读写（多路径回退，失败不静默） ---------- */
 let __wbProbe = { at: 0, ok: false, name: '', count: 0, plotCount: 0, writeOk: false, src: '', err: '' };
 
+/* 【修 v1.27】条目形态归一化。
+   ST 1.1.9 的世界书条目集合是 { [uid:string]: entry } 字典，不是数组。
+   但不同版本/不同挂载点还可能给数组、{entries:...} 等形态，
+   插件内部一律统一成「每项都带 uid 的数组」，写回时再还原成字典。 */
+function looksLikeEntry(x) {
+  return !!x && typeof x === 'object' && !Array.isArray(x)
+    && ('content' in x || 'comment' in x || 'key' in x || 'disable' in x || 'uid' in x);
+}
+/* 从任意形态里挖出条目字典/数组，返回 {[uid]: entry} 或 null */
+function findEntriesMap(raw, depth) {
+  if (!raw || depth > 4) return null;
+  if (Array.isArray(raw)) {
+    if (!raw.length) return null;
+    const m = {};
+    raw.forEach((e, i) => { if (looksLikeEntry(e)) m[e?.uid != null ? String(e.uid) : '__idx' + i] = e; });
+    return Object.keys(m).length ? m : null;
+  }
+  if (typeof raw !== 'object') return null;
+  /* 字典：{ "12": {comment, content...} } —— 值本身像条目 */
+  const vals = Object.values(raw);
+  if (vals.length && vals.every(looksLikeEntry)) return raw;
+  /* 包装层：{entries: ...} / {data:{entries:...}} */
+  for (const k of ['entries', 'data', 'worldInfo', 'world_info']) {
+    if (raw[k] && typeof raw[k] === 'object') {
+      const r = findEntriesMap(raw[k], depth + 1);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+/* 归一化成数组：保证每项都有 uid（缺失时用字典 key 回填，再不行给临时 uid） */
+function normalizeEntries(raw) {
+  const m = findEntriesMap(raw, 0);
+  if (!m) return [];
+  const out = [];
+  for (const [k, e] of Object.entries(m)) {
+    if (!looksLikeEntry(e)) continue;
+    const uid = e.uid != null ? e.uid : (/^\d+$/.test(k) ? Number(k) : k);
+    /* 回填 uid：写回时要以它为 key，丢了就等于新建条目 */
+    if (e.uid == null) { try { e.uid = uid; } catch (_) { /* 冻结对象则跳过 */ } }
+    out.push(e);
+  }
+  return out;
+}
+/* 还原成 ST 要的字典形态：{ [String(uid)]: entry } */
+function toEntriesDict(arr) {
+  const d = {};
+  (arr || []).forEach((e, i) => {
+    if (!looksLikeEntry(e)) return;
+    const uid = e.uid != null ? String(e.uid) : '__idx' + i;
+    d[uid] = e;
+  });
+  return d;
+}
+
 /* 从 ST 各种已知挂载点取世界书条目列表 */
 function wbReadLive() {
   const c = stGetContext() || {};
-  const cand = [c.worldInfo, c.world_info, c.worldinfo,
-    (typeof window !== 'undefined') ? window.worldInfo : null,
-    (typeof window !== 'undefined') ? window.world_info : null];
-  for (const o of cand) {
-    if (!o) continue;
-    if (Array.isArray(o) && o.length) return { entries: o, src: 'context(数组)' };
-    if (typeof o === 'object' && o.entries) {
-      const e = o.entries;
-      const arr = Array.isArray(e) ? e : Object.values(e);
-      if (arr.length) return { entries: arr, src: 'context(entries)' };
-    }
-    if (typeof o === 'object' && !Array.isArray(o) && Object.keys(o).length) {
-      /* 形如 {123: {...}} 的 uid → 条目 映射 */
-      const arr = Object.values(o).filter(x => x && typeof x === 'object');
-      if (arr.length && arr.every(x => 'content' in x || 'comment' in x || 'key' in x)) {
-        return { entries: arr, src: 'context(uid映射)' };
-      }
-    }
+  const cand = [];
+  const push = (o, tag) => { if (o) cand.push([o, tag]); };
+  /* ST 1.1.9：getContext() 上通常挂着 worldInfo（含 entries 字典） */
+  push(c.worldInfo, 'context.worldInfo');
+  push(c.world_info, 'context.world_info');
+  push(c.worldinfo, 'context.worldinfo');
+  if (typeof window !== 'undefined') {
+    push(window.worldInfo, 'window.worldInfo');
+    push(window.world_info, 'window.world_info');
+    push(window.worldinfo, 'window.worldinfo');
+    push(window.world_names, 'window.world_names');
+  }
+  for (const [o, tag] of cand) {
+    const arr = normalizeEntries(o);
+    if (arr.length) return { entries: arr, src: tag };
   }
   return null;
 }
@@ -2036,8 +2195,13 @@ function wbSlashProbe() {
   return out;
 }
 
-/* 当前世界书名字（多路径，含 DOM 兜底） */
+/* 当前世界书名字：手动指定 > context > 全局 > DOM 兜底 */
 function wbCurrentName() {
+  try {
+    /* 【修 v1.27】手动指定最优先——自动探测全挂时这是唯一出路 */
+    const manual = String(settings?.plotWorldbookName || '').trim();
+    if (manual) return manual;
+  } catch (e) { /* 忽略 */ }
   try {
     const c = stGetContext() || {};
     const n = c.worldInfoName || c.world_info_name || c.worldInfo?.name || c.world_info?.name
@@ -2071,19 +2235,47 @@ async function wbFetch(name) {
   });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const j = await r.json();
-  const e = j?.entries || j?.data?.entries || j?.data || j;
-  const arr = Array.isArray(e) ? e : Object.values(e || {});
+  /* 不猜固定层级：递归找出第一个形态像条目集合的对象 */
+  const arr = normalizeEntries(j);
+  if (!arr.length) throw new Error('返回里没找到条目（结构: ' + Object.keys(j || {}).join(',') + '）');
   return arr;
 }
 
+/* 【修 v1.27】写回必须是以 uid 字符串为 key 的对象，传数组会被 400 */
 async function wbWriteBack(name, entries) {
-  const body = { name, data: { entries } };
+  const dict = toEntriesDict(entries);
+  const body = { name, data: { entries: dict } };
   const r = await fetch('/api/worldinfo/edit', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  return r.ok;
+  if (!r.ok) {
+    let msg = 'HTTP ' + r.status;
+    try { const t = await r.text(); if (t) msg += ' ' + String(t).slice(0, 120); } catch (e) { /* 忽略 */ }
+    throw new Error(msg);
+  }
+  return true;
+}
+
+/* 持久化：ST 各版本的保存函数挂载点不一，逐个试 */
+async function wbPersist() {
+  const tries = [];
+  try {
+    const c = stGetContext() || {};
+    for (const fn of [c.saveWorldInfo, c.saveWorldInfoSettings, c.saveWorldInfoDebounced]) {
+      if (typeof fn === 'function') { await fn(); tries.push('context'); }
+    }
+  } catch (e) { /* 忽略 */ }
+  try {
+    const S = ST();
+    for (const fn of [S.saveWorldInfo, S.saveWorldInfoSettings]) {
+      if (typeof fn === 'function') { await fn(); tries.push('global'); }
+    }
+  } catch (e) { /* 忽略 */ }
+  /* 都没拿到就退回到让 ST 自己保存：触发一次世界书面板刷新不可靠，
+     这里明确返回是否真的调到了保存函数 */
+  return { saved: tries.length > 0, via: [...new Set(tries)].join('+') };
 }
 
 /* 剧情条目识别：uid >= 900000 是由插件生成的 273 章节点；
@@ -2105,95 +2297,161 @@ function entryChapter(e) {
   return null;
 }
 
-/* 读一次世界书并探测写入能力，结果缓存 30 秒 */
-async function wbProbe(force) {
+/* 读一次世界书并【实际试写】探测写入能力，结果缓存 30 秒 */
+async function wbProbe(force, opt) {
+  opt = opt || {};
   if (!force && __wbProbe.ok && Date.now() - __wbProbe.at < 30000) return __wbProbe;
-  const out = { at: Date.now(), ok: false, name: '', count: 0, plotCount: 0, writeOk: false, src: '', err: '' };
+  const out = {
+    at: Date.now(), ok: false, name: '', count: 0, plotCount: 0,
+    writeOk: false, writeVia: '', src: '', err: '', sample: [], nameSrc: '', writeErr: '',
+  };
   let entries = null, src = '';
   const live = wbReadLive();
   if (live) { entries = live.entries; src = live.src; }
   else {
     const nm = wbCurrentName();
-    if (!nm) { out.err = '读不到世界书：context 里没有条目，也拿不到世界书名字'; __wbProbe = out; return out; }
+    if (!nm) {
+      out.err = '读不到世界书：context 里没有条目，也拿不到世界书名字。'
+        + '请在下方「世界书名（手动指定）」里填上，例如 "HP贵族"。';
+      __wbProbe = out; return out;
+    }
     try { entries = await wbFetch(nm); src = 'api:/worldinfo/get'; out.name = nm; }
-    catch (e) { out.err = '读取失败：' + e.message; __wbProbe = out; return out; }
+    catch (e) { out.err = '读取失败：' + e.message + '（世界书名：' + nm + '）'; __wbProbe = out; return out; }
   }
   if (!entries || !entries.length) { out.err = '世界书里没有条目'; __wbProbe = out; return out; }
   out.ok = true; out.count = entries.length; out.src = src;
+  out.name = out.name || wbCurrentName() || '';
+  out.nameSrc = String(settings?.plotWorldbookName || '').trim() ? '手动指定' : (out.name ? '自动探测' : '');
   out.plotCount = entries.filter(isPlotEntry).length;
-  /* 写入能力：只在真要改的时候才试，这里仅记录名字是否可得 */
-  out.writeOk = !!(out.name || wbCurrentName());
+  /* 样例：确认数据结构契约——有没有 uid、disable 是什么类型 */
+  out.sample = entries.slice(0, 3).map(e => ({
+    uid: e?.uid, typeUid: typeof e?.uid,
+    disable: e?.disable, typeDisable: typeof e?.disable,
+    comment: String(e?.comment || e?.name || '').slice(0, 28),
+  }));
+  /* 【修 v1.27】真的试写一次：把原样数据回写，看接口收不收。
+     不改任何 disable，只是验证「这个结构能被接受且能落盘」。
+     只在用户主动点「检测世界书」时做（opt.noWrite 为空）；
+     wbApplyChapter 内部紧接着就要真写，跳过试写以免多写一次。 */
+  if (opt.noWrite) { out.writeOk = null; out.writeVia = '（本次跳过试写）'; __wbProbe = out; return out; }
+  try {
+    const nm = wbCurrentName() || out.name;
+    if (nm) {
+      await wbWriteBack(nm, entries);
+      out.writeOk = true; out.writeVia = 'api:/worldinfo/edit';
+      const ps = await wbPersist();
+      if (ps.saved) out.writeVia += ' + saveWorldInfo(' + ps.via + ')';
+    } else out.writeErr = '拿不到世界书名，无法试写';
+  } catch (e) { out.writeOk = false; out.writeErr = String(e?.message || e); }
   __wbProbe = out;
   return out;
 }
 
-/* 按章号启用/禁用。返回 {ok, changed, list, err} */
+/* 按章号启用/禁用。返回 {ok, changed, list, err}
+   【修 v1.27】以 entry.uid 为主键；写回一律用 {[String(uid)]: entry} 字典。 */
 async function wbApplyChapter(ch, range) {
-  const p = await wbProbe(true);
+  /* 跳过试写：紧接着就是真写，多试一次纯属浪费 */
+  const p = await wbProbe(true, { noWrite: true });
   if (!p.ok) return { ok: false, changed: 0, list: [], err: p.err || '读不到世界书' };
-  let entries = null;
+
+  /* 内存优先：context 里有就直接改内存里的对象（改完还得落盘） */
   const live = wbReadLive();
+  let entries;
   if (live) entries = live.entries;
-  else entries = await wbFetch(wbCurrentName() || p.name);
+  else {
+    const nm = wbCurrentName() || p.name;
+    if (!nm) return { ok: false, changed: 0, list: [], err: '拿不到世界书名，无法读取条目' };
+    try { entries = await wbFetch(nm); } catch (e) { return { ok: false, changed: 0, list: [], err: '读取失败：' + e.message }; }
+  }
 
   const lo = ch - range, hi = ch + range;
   const changed = [];
+  let touched = 0, skipped = 0;
   for (const e of entries) {
-    if (!isPlotEntry(e)) continue;
+    if (!looksLikeEntry(e)) continue;
+    if (!isPlotEntry(e)) continue;              // 非剧情条目一律不碰
     const ec = entryChapter(e);
-    if (ec == null) continue;
+    if (ec == null) { skipped++; continue; }
+    touched++;
     const want = (ec >= lo && ec <= hi) ? false : true;   // disable: 范围内=false(启用)
-    if (!!e.disable !== want) { e.disable = want; changed.push({ ch: ec, disable: want, e }); }
+    if (!!e.disable === want) continue;                   // 已是目标状态
+    e.disable = want;
+    changed.push({ uid: e.uid, ch: ec, disable: want, e, name: entryName(e) });
   }
-  /* 写回。三条路依次试，任一成功即止：
-     ① context 内存直改 —— 最快，但需 ST 自己保存才持久
-     ② /worldinfo/edit API —— 标准后端写入
-     ③ Slash 命令 —— 走 ST 原生 UI 通道，对读不通 context 的版本有效 */
-  let ok = false, src = ''; const tried = [];
 
-  /* ① context 内存：改得到 ≠ 存得住。只改内存而 ST 没保存，等于没改。 */
-  let memOk = false, apiOk = false, saved = false;
-  if (live) memOk = true;
-  /* ② API（真正落盘，优先于内存） */
+  /* 无需改动：直接算成功，但要把"扫了多少条"说清楚，便于判断识别是否正常 */
+  if (!changed.length) {
+    return {
+      ok: true, changed: 0, list: [], src: '无需改动（已是目标状态）', slash: 0,
+      touched, skipped, err: '',
+      note: `识别到剧情条目 ${touched} 条${skipped ? `，${skipped} 条解析不出章号已跳过` : ''}；目标第 ${lo}~${hi} 章状态已正确`,
+    };
+  }
+
+  /* 写回：① API（真正落盘）→ ② Slash 命令（原生 UI 通道） */
+  let apiOk = false, src = ''; const tried = [];
   try {
     const nm = wbCurrentName() || p.name;
-    if (nm) { apiOk = await wbWriteBack(nm, entries); if (!apiOk) tried.push('API 返回非 200'); }
-    else tried.push('拿不到世界书名字');
+    if (nm) { await wbWriteBack(nm, entries); apiOk = true; src = 'api:/worldinfo/edit'; }
+    else tried.push('拿不到世界书名，API 写入跳过');
   } catch (e) { tried.push('API:' + e.message); }
-  /* ③ 落盘：ST 有现成保存函数就调一次 */
+  /* 落盘：API 改的是服务端数据；内存对象已改，再让 ST 存一次确保一致 */
+  let saved = false;
   try {
-    const c = stGetContext();
-    if (typeof c?.saveWorldInfo === 'function') { await c.saveWorldInfo(); saved = true; }
+    const ps = await wbPersist();
+    saved = ps.saved;
+    if (saved) src += ' + saveWorldInfo(' + ps.via + ')';
   } catch (e) { /* 忽略 */ }
 
-  /* 只有"API 成功"或"内存已改且确实存了"才算真成功，否则继续试 Slash */
-  ok = apiOk || (memOk && saved);
-  if (apiOk) src = 'api:/worldinfo/edit';
-  else if (ok) src = 'context 内存 + saveWorldInfo';
-
-  /* ③ Slash 命令逐条启停：只有前两条都失败时才走这条 */
+  /* ③ Slash 命令兜底：API 不通时逐条启停，仍以 uid 对应的条目名为准 */
   let slashUsed = 0, slashErr = '';
-  if (!ok && changed.length) {
+  if (!apiOk && changed.length) {
     const sp = wbSlashProbe();
     if (sp.has) {
       for (const it of changed) {
-        const nm = entryName(it.e);
-        if (!nm) continue;
-        const r = await wbSlashSetEntry(nm, !it.disable);
+        if (!it.name) continue;
+        const r = await wbSlashSetEntry(it.name, !it.disable);
         if (r.ok) slashUsed++; else if (!slashErr) slashErr = r.err || '命令未生效';
       }
-      if (slashUsed) { ok = true; src = (src ? src + ' + ' : '') + `Slash 命令(${slashUsed} 条)`; }
+      if (slashUsed) { src = (src ? src + ' + ' : '') + `Slash 命令(${slashUsed} 条)`; }
     } else slashErr = sp.err;
   }
-  /* 已经是目标状态、无需改动，也算成功 */
-  if (!ok && !changed.length && (live || p.ok)) {
-    return { ok: true, changed: 0, list: [], src: '无需改动（已是目标状态）', slash: 0, err: '' };
+
+  const ok = apiOk || slashUsed > 0;
+  if (ok) {
+    return { ok: true, changed: changed.length, list: changed, src, slash: slashUsed, touched, skipped, err: '' };
   }
-  if (ok) return { ok: true, changed: changed.length, list: changed, src, slash: slashUsed, err: '' };
   return {
-    ok: false, changed: 0, list: [], slash: 0, src,
-    err: '世界书写入不可用（试过：' + (tried.join('；') || '无可用路径') + (slashErr ? '；Slash:' + slashErr : '') + '）。请手动改条目启用状态。'
+    ok: false, changed: 0, list: [], slash: 0, src, touched, skipped,
+    err: '世界书写入失败（试过：' + (tried.join('；') || '无可用路径')
+      + (slashErr ? '；Slash:' + slashErr : '') + '）。'
+      + '请在下方「世界书名（手动指定）」填上正确名字后重试，或手动改条目启用状态。',
   };
+}
+
+/* 复检：重新读一次，确认目标章真的处于启用状态（对应验收"刷新后保持"） */
+async function wbVerify(ch, range) {
+  try {
+    const live = wbReadLive();
+    let entries;
+    if (live) entries = live.entries;
+    else {
+      const nm = wbCurrentName();
+      if (!nm) return { ok: false, err: '拿不到世界书名', on: [], off: [] };
+      entries = await wbFetch(nm);
+    }
+    const lo = ch - range, hi = ch + range;
+    const on = [], bad = [];
+    for (const e of entries) {
+      if (!isPlotEntry(e)) continue;
+      const ec = entryChapter(e);
+      if (ec == null) continue;
+      const inRange = ec >= lo && ec <= hi;
+      if (inRange) { if (e.disable) bad.push(ec); else on.push(ec); }
+      else if (!e.disable) bad.push(ec);
+    }
+    return { ok: bad.length === 0, on: on.sort((a, b) => a - b), bad, err: bad.length ? `状态不符的章：${bad.join(',')}` : '' };
+  } catch (e) { return { ok: false, err: String(e?.message || e), on: [], bad: [] }; }
 }
 
 /* 条目名字（用于 Slash 命令） */
@@ -3767,6 +4025,10 @@ function plotPaneHTML() {
       <input class="hp-inp" data-num="plotRange" value="${s.plotRange ?? 1}" placeholder="1"></div>
     <div class="hp-fld"><label>手动指定章号（0 = 交给自动判定）</label>
       <input class="hp-inp" data-num="plotManualCh" value="${s.plotManualCh ?? 0}" placeholder="0"></div>
+    <div class="hp-fld"><label>世界书名（手动指定）<small>自动探测不到就填这里，优先级最高</small></label>
+      <input class="hp-inp" data-str="plotWorldbookName" value="${esc(s.plotWorldbookName || '')}" placeholder="例如：HP贵族"></div>
+    <div class="hp-sw"><div class="l">写入后复检<small>改完重读一次，确认状态真的生效</small></div>
+      <div class="hp-tg${s.plotVerify !== false ? ' on' : ''}" data-sw="plotVerify"></div></div>
     <div class="hp-fld"><label>定位提示词用哪条 API<small>见「提示词」面板第 ⑩ 项，可单独配</small></label>
       <select class="hp-inp" data-ptapi="plot">${optApi(s.prompts?.plot?.api || '')}</select></div>
     <div class="hp-row" style="margin-top:10px">
@@ -3870,6 +4132,11 @@ function paneHTML(i) {
     </div>
     <div class="ds" style="margin-top:2px">API 配置改动会<b>立即同步写入浏览器本地</b>，不依赖云端保存；刷新后从本地独立存档读回。
       若仍担心丢失，用「导出」存一份 JSON。</div>
+    <div class="hp-fld" style="margin-top:12px"><label>配置存储体检</label>
+      <div id="hp-store-diag" style="font-size:11.5px;line-height:1.75"></div>
+      <div class="ds" style="margin-top:4px">配置同时写三处：浏览器 localStorage（同步）、IndexedDB（容量大、更抗清理）、ST 扩展存档。
+        任一处失败都会在这里红字报出原因。三处全红＝当前浏览器禁用了本地存储，请换普通浏览器或改用「导出」备份。</div>
+    </div>
     <div class="hp-fld" style="margin-top:14px"><label>常用预设（填入最后一条的 Base URL）</label><div class="hp-chips">
       ${Object.entries(PRESETS).map(([k, v]) => `<span class="hp-chip" data-preset="${k}">${v.name}</span>`).join('')}
     </div></div>
@@ -4787,17 +5054,43 @@ function bindPane(host) {
   /* 【v1.25】剧情进度控制：定位 + 启用/禁用世界书章节条目 */
   onEv(pane.querySelector('#hp-plot-wb'), 'click', async () => {
     const out = pane.querySelector('#hp-plot-out');
+    out.textContent = '正在检测…';
     try {
+      /* 先回收输入框里"敲了但没失焦"的世界书名，否则手动填了也不生效 */
+      try { syncInputsFromDOM(pane); } catch (e) { /* 忽略 */ }
       const p = await wbProbe(true);
       const sp = wbSlashProbe();
       const slashInfo = sp.has
         ? `Slash 命令：可用（共 ${sp.total} 条）\n  相关命令：${sp.world.length ? sp.world.join('、') : '未能枚举'}\n  单条启停命令：${sp.entryCmd ? '有 ✓' : '未发现'}${sp.err ? '\n  （' + sp.err + '）' : ''}`
         : `Slash 命令：不可用（${sp.err}）`;
-      const nm = wbCurrentName();
-      const nameInfo = `世界书名：${nm || '拿不到 ← 这是读不通的主因'}`;
-      out.textContent = p.ok
-        ? `世界书检测成功\n来源：${p.src}\n${nameInfo}\n总条目：${p.count}\n剧情条目：${p.plotCount} 条${p.plotCount ? '（uid 900001 起，对应第 1 章）' : '（没找到 —— 确认 273 章剧情节点已导入世界书）'}\n\n${slashInfo}`
-        : `检测失败：${p.err}\n\n${nameInfo}\n\n${slashInfo}\n\n排查顺序：\n1) 先在 ST 里打开一次世界书面板并选中一本（插件需要从下拉框读到名字）\n2) 确认世界书总开关是开着（可试 /world-on）\n3) 若条目能改但读不到列表，定位功能仍可用，只是无法自动启停`;
+
+      if (!p.ok) {
+        out.textContent = `检测失败：${p.err}\n\n世界书名：${wbCurrentName() || '拿不到 ← 这是读不通的主因'}\n\n${slashInfo}`
+          + `\n\n排查顺序：\n1) 在下方「世界书名（手动指定）」里填上世界书的确切名字（区分大小写、无首尾空格）\n`
+          + `2) 在 ST 里打开一次世界书面板并选中同一本\n3) 确认世界书总开关开着（可试 /world-on）`;
+        return;
+      }
+
+      /* 数据结构契约样例：确认是 {uid: entry} 字典、uid/disable 类型对不对 */
+      const smp = (p.sample || []).map((s, i) =>
+        `  ${i + 1}. uid=${s.uid}(${s.typeUid}) disable=${s.disable}(${s.typeDisable}) 「${s.comment}」`).join('\n');
+      const contract = (p.sample || []).length
+        ? `数据结构样例（前 3 条）：\n${smp}`
+        : '数据结构样例：无';
+      const warn = [];
+      if ((p.sample || []).some(s => s.uid == null)) warn.push('有条目没有 uid —— 写回时会被当成新条目');
+      if ((p.sample || []).some(s => s.typeDisable !== 'boolean')) warn.push('disable 不是布尔值 —— 请检查条目数据');
+      if (!p.plotCount) warn.push('没识别出剧情条目 —— 确认 273 章节点已导入，且 comment 含「第N章」');
+
+      out.textContent = `世界书检测成功\n`
+        + `来源：${p.src}\n`
+        + `世界书名：${p.name || wbCurrentName() || '（空）'}${p.nameSrc ? '　[' + p.nameSrc + ']' : ''}\n`
+        + `总条目：${p.count}\n`
+        + `剧情条目：${p.plotCount} 条\n\n`
+        + contract + `\n\n`
+        + `写入能力：${p.writeOk ? '✅ 实测可写（' + p.writeVia + '）' : '❌ ' + (p.writeErr || '试写失败')}\n\n`
+        + slashInfo
+        + (warn.length ? `\n\n⚠ 发现问题：\n` + warn.map(w => '  · ' + w).join('\n') : '\n\n✅ 数据结构契约对齐，未发现问题');
     } catch (e) { out.textContent = '检测出错：' + e.message; }
   });
 
@@ -4833,10 +5126,22 @@ function bindPane(host) {
       const a = await wbApplyChapter(r.ch, Number(settings.plotRange) || 0);
       const en = a.list.filter(x => !x.disable).map(x => '第' + x.ch + '章').join('、');
       const dis = a.list.filter(x => x.disable).length;
-      out.textContent = `定位：第 ${r.ch} 章（${r.src}）\n理由：${r.why}\n\n`
-        + (a.ok
-          ? `已改动 ${a.changed} 条条目\n启用：${en || '（无需改动）'}\n禁用：${dis} 条\n写入方式：${a.src}`
-          : `⚠ 世界书写入未成功：${a.err}\n\n应启用的章节：第 ${Math.max(1, r.ch - (Number(settings.plotRange) || 0))} ~ ${r.ch + (Number(settings.plotRange) || 0)} 章\n请在世界书里手动启用这些条目。`);
+      let txt = `定位：第 ${r.ch} 章（${r.src}）\n理由：${r.why}\n\n`;
+      if (a.ok) {
+        txt += `已改动 ${a.changed} 条条目\n启用：${en || '（无需改动）'}\n禁用：${dis} 条\n写入方式：${a.src}`
+          + (a.note ? `\n${a.note}` : '')
+          + (a.skipped ? `\n⚠ ${a.skipped} 条剧情条目解析不出章号，已跳过` : '');
+        /* 复检：重读一次确认状态真的落住了（刷新后还在） */
+        if (settings.plotVerify !== false) {
+          const v = await wbVerify(r.ch, Number(settings.plotRange) || 0);
+          txt += v.ok
+            ? `\n\n✅ 复检通过：目标章节确实处于启用状态（${v.on.join('/') || '无'}）`
+            : `\n\n⚠ 复检未通过：${v.err}\n写入返回成功但重读不一致 —— 多半是没真正落盘，去世界书面板手动保存一次`;
+        }
+      } else {
+        txt += `⚠ 世界书写入未成功：${a.err}\n\n应启用的章节：第 ${Math.max(1, r.ch - (Number(settings.plotRange) || 0))} ~ ${r.ch + (Number(settings.plotRange) || 0)} 章\n请在世界书里手动启用这些条目。`;
+      }
+      out.textContent = txt;
     } catch (e) { out.textContent = '执行出错：' + e.message; }
     finally { btn.disabled = false; btn.textContent = '现在定位一次'; }
   });
@@ -6066,6 +6371,10 @@ function addFab() {
 function loadSettings() {
   const saved = restoreFromBackup();
   settings = Object.assign(structuredClone(DEFAULTS), saved || {});
+  /* 【修 v1.28】IndexedDB 兜底回填（异步）：
+     页面刚打开时 IndexedDB 还没读完，这里先把它的值补进来，
+     之后 loadSettingsAsync() 会再用完整时间戳比对做一次校正。 */
+  try { idbLoadSettings().then(o => { if (o && o.data) mergeSavedFrom(o.data); }); } catch (e) {}
   stExtensionSettings()[EXT_ID] = settings;
   if (!Array.isArray(settings.tiers) || settings.tiers.length !== 6) settings.tiers = TIERS.map(t => t.max);
 
@@ -6104,8 +6413,39 @@ function loadSettings() {
 }
 /* 【修 v1.24】把 API 的实际落盘情况画出来：三处存储各有多少条、谁是最新的。
    以前只能靠"刷新看还在不在"来验证，现在面板上直接可读。 */
+/* 【修 v1.28】配置存储体检：把三处存储的实时状态画出来。
+   以前配置丢了只能靠猜，现在能直接看到是哪一环失败、为什么失败。 */
+async function paintStoreDiag(pane) {
+  const box = pane && pane.querySelector('#hp-store-diag');
+  if (!box) return;
+  const lsOk = lsAvailable();
+  const idb = __storeDiag.idb;
+  const st = stExtensionSettings()[EXT_ID];
+  const nSt = st && typeof st === 'object' ? Object.keys(st).length : 0;
+  const t = (v) => v ? new Date(v).toLocaleTimeString() : '—';
+  let sz = 0;
+  try { sz = JSON.stringify(Object.assign({}, settings, { nodeMap: undefined })).length; } catch (e) {}
+  const line = (ok, name, detail) =>
+    `<div><span style="color:${ok ? 'var(--hp-ok,#5ecb8f)' : 'var(--hp-err,#e06c75)'}">${ok ? '●' : '●'}</span> `
+    + `<b>${name}</b> <span style="color:var(--hp-tx3)">${detail}</span></div>`;
+  const rows = [];
+  rows.push(line(lsOk && (!__storeDiag.ls || __storeDiag.ls.ok), 'localStorage',
+    !lsOk ? '不可用（隐私模式 / APP 限制）'
+          : (__storeDiag.ls ? `${Math.round(__storeDiag.ls.bytes / 1024)}KB · ${t(__storeDiag.ls.t)}${__storeDiag.ls.err ? ' · ' + escHtml(__storeDiag.ls.err) : ''}` : '待写入')));
+  const idbOk = !!(idb && idb.ok);
+  rows.push(line(idbOk, 'IndexedDB 兜底',
+    idbOk ? `已写入 · ${t(idb.t)}` : (idb ? escHtml(idb.err || '写入失败') : '待写入')));
+  rows.push(line(nSt > 0, 'ST 扩展存档', `${nSt} 个字段`));
+  rows.push(`<div style="color:var(--hp-tx3);margin-top:2px">当前配置 ${Math.round(sz / 1024)}KB`
+    + ` · 最后保存 ${t(__storeDiag.lastSave)}`
+    + (__storeDiag.lastErr ? ` · <span style="color:var(--hp-err,#e06c75)">${escHtml(__storeDiag.lastErr)}</span>` : '')
+    + `</div>`);
+  box.innerHTML = rows.join('');
+}
+
 function paintApiStore(pane) {
   const box = pane && pane.querySelector('#hp-api-store');
+  try { paintStoreDiag(pane); } catch (e) {}
   if (!box) return;
   const solo = loadApisStandalone();
   const nSolo = solo ? solo.apis.length : -1;
