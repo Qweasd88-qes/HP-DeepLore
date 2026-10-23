@@ -28,6 +28,40 @@
  * （此前用相对路径 import 曾导致模块解析失败、整个文件不执行）
  * -------------------------------------------------------------------------- */
 
+/* ----【修 v1.39】顶层崩溃兜底 ----
+   此前只要本文件在顶层抛异常（例如旧浏览器没有 structuredClone），
+   boot() 就永远不会被注册，而 style.css 由 ST 单独加载、照常生效 ——
+   现象是「面板样式都在，但功能全部失效」，且控制台之外没有任何提示。
+   现在：捕获顶层错误，DOM 就绪后直接把原因画到页面上，不用开控制台也能看见。 */
+window.__hpFatal = null;
+window.addEventListener('error', function (e) {
+  if (window.__hp) return;                 // 已成功启动，不再提示
+  window.__hpFatal = (e && (e.error && e.error.stack || e.message)) || '未知错误';
+  try { window.__hpPaintFatal(); } catch (_) { /* ignore */ }
+});
+window.__hpPaintFatal = function () {
+  if (!window.__hpFatal || window.__hp) return;
+  if (document.getElementById('hp_fatal')) return;
+  var d = document.createElement('div');
+  d.id = 'hp_fatal';
+  d.style.cssText = 'position:fixed;left:12px;right:12px;bottom:12px;z-index:999999;' +
+    'background:#3a1c1c;color:#ffd9d9;border:1px solid #a44;padding:12px 14px;' +
+    'border-radius:10px;font:13px/1.6 system-ui,sans-serif;max-height:45vh;overflow:auto;';
+  d.innerHTML = '<b style="color:#ff8a8a">HP-DeepLore 启动失败</b><br>' +
+    '插件脚本在加载阶段抛出异常，所有功能均未启用（样式仍在属正常现象）。<br>' +
+    '请把下面这段发给开发者：<br><pre style="white-space:pre-wrap;margin:8px 0 0;' +
+    'font-size:11px;color:#ffb4b4">' +
+    String(window.__hpFatal).replace(/[<>&]/g, function (c) {
+      return { '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c];
+    }).slice(0, 1200) + '</pre>';
+  (document.body || document.documentElement).appendChild(d);
+};
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', function () {
+    setTimeout(function () { try { window.__hpPaintFatal(); } catch (_) {} }, 300);
+  });
+}
+
 /* ---- 全局 API 安全获取 ---- */
 function ST() { return window.SillyTavern || window.SillyTavernContext || {}; }
 function stExtensionSettings() {
@@ -310,7 +344,7 @@ function stEventTypes() {
 }
 
 const EXT_ID = 'hp-deeplore';
-const EXT_VER = 'v1.38.0';
+const EXT_VER = 'v1.39.0';
 const EXT_NAME = 'HP DeepLore';
 const DB_NAME = 'hp_deeplore';
 const DB_VER = 2;   /* 【修 v1.28】+1：新增 settings store，用于配置兜底存储 */
@@ -412,7 +446,17 @@ const DEFAULTS = {
   novelMeta: null,
   indexMeta: null,
 };
-let settings = structuredClone(DEFAULTS);
+/* 【修 v1.39】structuredClone 是 Chrome 98+ / Safari 15.4+ 才有的 API。
+   它原本在【模块顶层】裸调用：旧版手机 WebView 上直接抛 ReferenceError，
+   整个 index.js 停在这一行，boot() 永远不会注册 —— 表现为「样式在、功能全无」。
+   改为安全深拷贝：优先 native，失败回退 JSON。DEFAULTS 全是纯数据，JSON 安全。 */
+function deepClone(o) {
+  try {
+    if (typeof structuredClone === 'function') return structuredClone(o);
+  } catch (e) { /* 某些对象含函数/Date 时 native 会抛，回退 JSON */ }
+  try { return JSON.parse(JSON.stringify(o)); } catch (e) { return o; }
+}
+let settings = deepClone(DEFAULTS);
 
 /* ------------------------ IndexedDB ------------------------ */
 function openDB() {
@@ -5880,7 +5924,7 @@ function bindPane(host) {
       if (j.novel) await idbSet(STORE.novel, 'main', j.novel);
       if (j.index) await idbSet(STORE.index, 'main', j.index);
       if (j.alias) { await idbSet(STORE.alias, 'main', j.alias); settings.aliasMap = j.alias; }
-      if (j.settings) settings = Object.assign(structuredClone(DEFAULTS), j.settings);
+      if (j.settings) settings = Object.assign(deepClone(DEFAULTS), j.settings);
       saveSettings();
       toast('导入完成', 'ok');
       updateIdxStatus(pane);
@@ -6274,7 +6318,7 @@ async function updateIdxStatus(pane) {
 function hpBuildDiagText(wbOut) {
   const s = settings || {};
   const L = [];
-  L.push('HP-DeepLore 诊断 · v1.38.0');
+  L.push('HP-DeepLore 诊断 · v1.39.0');
   L.push('时间：' + new Date().toLocaleString('zh-CN'));
   L.push('世界书：' + (s.plotWorldbookName || '(未手动指定，靠自动探测)'));
   L.push('定位范围：±' + (s.plotRange == null ? 1 : s.plotRange) + ' 章');
@@ -7619,7 +7663,7 @@ function addFab() {
  * ========================================================================== */
 function loadSettings() {
   const saved = restoreFromBackup();
-  settings = Object.assign(structuredClone(DEFAULTS), saved || {});
+  settings = Object.assign(deepClone(DEFAULTS), saved || {});
   /* 【修 v1.28】IndexedDB 兜底回填（异步）：
      页面刚打开时 IndexedDB 还没读完，这里先把它的值补进来，
      之后 loadSettingsAsync() 会再用完整时间戳比对做一次校正。 */
