@@ -310,7 +310,7 @@ function stEventTypes() {
 }
 
 const EXT_ID = 'hp-deeplore';
-const EXT_VER = 'v1.33.0';
+const EXT_VER = 'v1.34.0';
 const EXT_NAME = 'HP DeepLore';
 const DB_NAME = 'hp_deeplore';
 const DB_VER = 2;   /* 【修 v1.28】+1：新增 settings store，用于配置兜底存储 */
@@ -2129,19 +2129,47 @@ async function thWrite(name, wantMap, opt) {
   if (!t || typeof t.updateWorldbookWith !== 'function') return { ok: false, err: 'updateWorldbookWith 不可用' };
   const uids = Object.keys(wantMap || {});
   const nameMap = (opt && opt.nameMap) || null;
-  if (!uids.length && !nameMap) return { ok: true, changed: 0, via: 'TavernHelper.updateWorldbookWith（无需改动）' };
+  const targets = (opt && opt.targets) || null;
+  const hasTargets = Array.isArray(targets) && targets.length > 0;
+  /* 【修 v1.34】守卫必须把 targets 算进去。旧版只看 wantMap/nameMap，
+     于是「只传 targets」的调用会被当成"无需改动"直接返回 changed=0，
+     而实际上一条都没匹配 —— 这是最容易查错方向的一类假失败。 */
+  if (!uids.length && !nameMap && !hasTargets) return { ok: true, changed: 0, via: 'TavernHelper.updateWorldbookWith（无需改动）' };
 
-  /* 生成 update_fn。返回的闭包自带计数器，每档尝试独立计数。 */
+  /* 生成 update_fn。返回的闭包自带计数器，每档尝试独立计数。
+     【修 v1.34】匹配改为「多键求交集」：
+     uid 在导入后会被 ST 重排，插件手里的 900000 与书里的实际 uid 毫无关系，
+     只按 uid 匹配必然 matched=0。现在把 uid / name / comment / 章号
+     全部作为候选键，任一命中即认定是同一条目。 */
+  const tKeys = [];
+  if (hasTargets) {
+    for (const t of targets) tKeys.push({ ks: targetKeys(t), on: !!t.on, isPlot: t.ch != null });
+  }
+  /* 兼容旧调用：wantMap/nameMap 转成同样的键集合。
+     注意：wantMap 与 nameMap 之间没有可靠的下标对应关系，
+     所以这里只把 uid 键带上，名称键由下面 nameMap 单独成组，
+     避免「A 的 uid + B 的名字」这种跨条目串匹配。 */
+  if (wantMap && typeof wantMap === 'object') {
+    for (const k of Object.keys(wantMap)) {
+      const ks = ['u:' + String(k)];
+      const n = Number(k);
+      if (Number.isFinite(n)) ks.push('u:' + String(n));
+      tKeys.push({ ks, on: !!wantMap[k], isPlot: false });
+    }
+  }
+  for (const k of Object.keys(nameMap || {})) {
+    const s = String(k).trim();
+    tKeys.push({ ks: ['n:' + s, 'n:' + s.slice(0, 40)], on: !!nameMap[k], isPlot: false });
+  }
+
   const mkFn = (counter) => function (entry) {
     if (entry == null) return entry;
+    const eks = entryKeys(entry);
+    if (!eks.length) return entry;                 // 连标识都没有，绝不动
     let on = null;
-    const key = String(entry.uid);
-    if (Object.prototype.hasOwnProperty.call(wantMap, key)) on = !!wantMap[key];
-    if (on === null && nameMap) {
-      const nmk = String(entry.name || '') + ' ' + String(entry.comment || '');
-      for (const k of Object.keys(nameMap)) {
-        if (k && nmk.indexOf(k) >= 0) { on = !!nameMap[k]; break; }
-      }
+    for (const t of tKeys) {
+      /* 章号键只在目标本身是剧情条目时使用，避免误伤同名普通条目 */
+      if (keysHit(t.ks, eks, t.isPlot)) { on = t.on; break; }
     }
     if (on === null) return entry;                 // 不匹配的条目原样返回，绝不动
     counter.n++;
@@ -2186,15 +2214,21 @@ function isCriticalEntry(e) {
 /* 【新增 v1.33】轮询读取某条目的启用状态。
    TH 的 render 防抖、ST 的 UI 重绘都可能让写入晚一拍落盘，
    只在上一次写入后立刻读一次，会把"还没落盘"误判成"写入无效"。 */
-async function wbWaitEnabled(name, uid, expect, tries, gap) {
+async function wbWaitEnabled(name, uid, expect, tries, gap, opt) {
   const n = Math.max(1, tries || 6);
   const g = Math.max(0, gap == null ? 120 : gap);
+  /* 【修 v1.34】定位不能只赌 uid：重排后 uid 对不上，会一直读不到而误判。
+     改用与目标相同的多键去匹配，uid 只是其中一个候选键。 */
+  const tks = (opt && opt.tKeys) || (uid != null ? ['u:' + String(uid)] : []);
   let last = null;
   for (let i = 0; i < n; i++) {
     try {
       const a = await wbReadAny(name);
-      const e = ((a && a.entries) || []).find(x => String(x.uid) === String(uid));
-      last = e ? entryIsEnabled(e) : null;
+      const list = (a && a.entries) || [];
+      const hit = tks.length
+        ? list.find(x => keysHit(tks, entryKeys(x), true))
+        : null;
+      last = hit ? entryIsEnabled(hit) : null;
     } catch (e) { last = null; }
     if (last === expect) return last;
     if (i < n - 1) await new Promise(r => setTimeout(r, g));
@@ -2213,54 +2247,68 @@ async function wbProbeWriteRoundTrip(name, entries) {
   const list = Array.isArray(entries) ? entries : [];
   /* 先用剧情条目试（数量多、临时改动影响小），且优先挑当前是禁用的：
      万一还原失败，多启用一条剧情条目，也比误关掉一条要害条目轻。 */
-  const pick =
-    list.find(e => isPlotEntry(e) && !isCriticalEntry(e) && entryIsEnabled(e) === false) ||
-    list.find(e => isPlotEntry(e) && !isCriticalEntry(e)) ||
-    list.find(e => !isCriticalEntry(e));
-  if (!pick) return { ok: false, err: '找不到可安全试写的条目（全是要害条目）' };
+  /* 【修 v1.34】候选不止一个：uid 重排后第一条可能匹配不上，
+     换几条再试才能区分「这一条的键特殊」和「整个匹配机制失效」。 */
+  const pool = list.filter(e => isPlotEntry(e) && !isCriticalEntry(e));
+  const cands = [];
+  const off = pool.filter(e => entryIsEnabled(e) === false);
+  const on = pool.filter(e => entryIsEnabled(e) === true);
+  for (let i = 0; i < 3; i++) { if (off[i]) cands.push(off[i]); }
+  if (!cands.length) for (let i = 0; i < 3; i++) { if (on[i]) cands.push(on[i]); }
+  if (!cands.length) {
+    const safe = list.filter(e => !isCriticalEntry(e));
+    for (let i = 0; i < 3; i++) { if (safe[i]) cands.push(safe[i]); }
+  }
+  if (!cands.length) return { ok: false, err: '找不到可安全试写的条目（全是要害条目）' };
 
   if (thHas('updateWorldbookWith')) {
-    const uid = String(pick.uid), orig = entryIsEnabled(pick);
-    /* 名称兜底：导入世界书时 ST 常重排 uid，只按 uid 匹配会一条都改不动 */
-    const nmKey = String(pick.name || pick.comment || '').slice(0, 40);
-    const nameMap = nmKey ? { [nmKey]: !orig } : null;
-    let flipped = null, restored = null, err = '', matched = -1;
-    try {
-      /* 【修 v1.33】thWrite 失败是「返回 ok:false」而不是抛异常，
-         只看 catch 会漏掉真实原因，最后报成含糊的"写入未生效"。 */
-      const r1 = await thWrite(nm, { [uid]: !orig }, { nameMap });
-      if (r1 && r1.ok === false) err = err || String(r1.err || 'TH 写入失败（未给出原因）');
-      if (r1 && typeof r1.changed === 'number') matched = r1.changed;
-      /* TH 的 render 有防抖，落盘可能晚一拍；立刻读一次就下结论会误判 */
-      flipped = await wbWaitEnabled(nm, uid, !orig, 6, 120);
-    } catch (e) { err = err || String(e?.message || e); }
-    /* 无论前面成败，都尽力还原 */
-    try {
-      const r2 = await thWrite(nm, { [uid]: !!orig }, { nameMap: nmKey ? { [nmKey]: !!orig } : null });
-      if (r2 && r2.ok === false) err = err || String(r2.err || 'TH 还原失败（未给出原因）');
-      restored = await wbWaitEnabled(nm, uid, !!orig, 6, 120);
-    } catch (e2) { err = err || String(e2?.message || e2); }
+    /* 【修 v1.34】逐个候选试：第一条的键可能对不上（uid 重排、名称被改写），
+       但换一条未必。只有全部候选都 matched=0，才说明匹配机制真的失效。 */
+    const attempts = [];
+    for (const pick of cands) {
+      const uid = String(pick.uid), orig = entryIsEnabled(pick);
+      const nmKey = String(pick.name || pick.comment || '').slice(0, 40);
+      const chNo = entryChapter(pick);
+      const tk = targetKeys({ uid: pick.uid, name: String(pick.name || ''), comment: String(pick.comment || ''), ch: chNo });
+      const one = [{ uid: pick.uid, name: String(pick.name || pick.comment || ''), comment: String(pick.comment || ''), ch: chNo, on: !orig }];
+      let flipped = null, restored = null, err = '', matched = -1;
+      try {
+        /* 【修 v1.33】thWrite 失败是「返回 ok:false」而不是抛异常，
+           只看 catch 会漏掉真实原因，最后报成含糊的"写入未生效"。 */
+        const r1 = await thWrite(nm, null, { targets: one });
+        if (r1 && r1.ok === false) err = err || String(r1.err || 'TH 写入失败（未给出原因）');
+        if (r1 && typeof r1.changed === 'number') matched = r1.changed;
+        /* TH 的 render 有防抖，落盘可能晚一拍；立刻读一次就下结论会误判 */
+        flipped = await wbWaitEnabled(nm, uid, !orig, 6, 120, { tKeys: tk });
+      } catch (e) { err = err || String(e?.message || e); }
+      /* 无论前面成败，都尽力还原 */
+      try {
+        const back = [{ uid: pick.uid, name: String(pick.name || pick.comment || ''), comment: String(pick.comment || ''), ch: chNo, on: !!orig }];
+        const r2 = await thWrite(nm, null, { targets: back });
+        if (r2 && r2.ok === false) err = err || String(r2.err || 'TH 还原失败（未给出原因）');
+        restored = await wbWaitEnabled(nm, uid, !!orig, 6, 120, { tKeys: tk });
+      } catch (e2) { err = err || String(e2?.message || e2); }
 
-    let thErr = '';
-    if (err) thErr = 'TH 写入异常：' + err;
-    /* uid 一条都没匹配上：这不是"没落盘"，是匹配键错了，必须分开说，
-       否则用户会一直去查落盘，而真正的原因是导入重排。 */
-    if (!thErr && matched === 0) {
-      thErr = `updateWorldbookWith 未匹配到任何条目（uid=${uid}，条目名「${nmKey}」）——` +
-              `多半是导入时 uid 被 ST 重排；插件已尝试按名称兜底，可用「只看不改」确认实际 uid`;
+      let thErr = '';
+      if (err) thErr = 'TH 写入异常：' + err;
+      else if (matched === 0) thErr = `未匹配到任何条目（uid=${uid}${chNo != null ? `，第${chNo}章` : ''}，条目名「${nmKey}」）`;
+      else if (restored !== !!orig) thErr = `往返还原失败（uid=${uid} 现在为 ${restored}，应为 ${!!orig}）`;
+      else if (flipped !== !orig) thErr = `写入未生效（uid=${uid} 改后仍为 ${flipped}，期望 ${!orig}）——已等 720ms 重读 6 次仍不变`;
+
+      attempts.push({ uid, nmKey, chNo, thErr, matched });
+      if (!thErr) {
+        return {
+          ok: true,
+          via: `TavernHelper.updateWorldbookWith（往返实测：关闭↔启用→重读→还原，均成功；试写条目 uid=${uid}${chNo != null ? `，第${chNo}章` : ''}）`,
+        };
+      }
     }
-    if (!thErr && restored !== !!orig) {
-      thErr = `往返还原失败（uid=${uid} 现在为 ${restored}，应为 ${!!orig}）——请手动检查该条目`;
-    }
-    if (!thErr && flipped !== !orig) {
-      thErr = `写入未生效（uid=${uid} 改后仍为 ${flipped}，期望 ${!orig}）——已等 720ms 重读 6 次仍不变`;
-    }
-    if (!thErr) {
-      return {
-        ok: true,
-        via: `TavernHelper.updateWorldbookWith（往返实测：关闭↔启用→重读→还原，均成功；试写条目 uid=${uid}）`,
-      };
-    }
+    /* 全部候选都失败：把"插件持有的 uid"与"世界书里实际的 uid"都列出来，
+       这是确认 uid 重排最直接的证据，也是用户排查的第一手材料。 */
+    const realUids = list.filter(isPlotEntry).slice(0, 3).map(e => String(e.uid)).join('/');
+    const thErr = `TH 试写 ${attempts.length} 条全部失败：` +
+      attempts.map(a => `uid=${a.uid}${a.thErr ? '（' + a.thErr + '）' : ''}`).join('；') +
+      `。插件读到剧情条目 uid 样例=${realUids || '（无）'}`;
     /* TH 这条路走不通：再试一次全量写回，两路都失败才判 ❌，
        并把两条路各自的失败原因都列出来，便于定位。 */
     try {
@@ -2583,23 +2631,82 @@ async function wbPersist() {
   return { saved: tries.length > 0, via: [...new Set(tries)].join('+') };
 }
 
-/* 剧情条目识别：uid >= 900000 是由插件生成的 273 章节点；
-   也兼容 comment 形如「[Y1-001] 剧情·…·第1章（…）」的命名 */
-const PLOT_UID_BASE = 900000;
+/* ==========================================================================
+   【修 v1.34】放弃「uid 从 900000 起」的假设。
+
+   uid 是 ST 内部的书内索引，导入/迁移/跨格式转换时会被重排：
+   外部格式（角色卡 V2/V3、独立世界书文件）用数组 + id 字段，ST 导入时
+   必须归一化成 { [uid]: entry } 对象字典并重新分配 uid。官方 PR #5921
+   就是修这个问题的。所以插件持有 900000，书里实际可能是 0、1、2……
+
+   正确策略：按内容特征（name / comment 里的「第N章」）识别剧情条目，
+   运行时动态读取每条目的真实 uid 去操作。
+   ========================================================================== */
+const PLOT_UID_BASE = 900000;   // 仅作兼容旧库的辅助提示，不再作为识别依据
+function entryText(e) {
+  return String(e?.comment || '') + ' ' + String(e?.name || '') + ' ' + String(e?.entryName || e?.key || '');
+}
 function isPlotEntry(e) {
+  if (!e) return false;
+  const t = entryText(e);
+  /* 主判据：内容特征。comment 或 name 里出现「第N章」即视为剧情节点条目。
+     不再要求必须同时带 [Y1-001] 前缀——导入时前缀可能被截断或改写。 */
+  if (/第\d+章/.test(t)) return true;
+  /* 辅助：uid 落在 900000 区间（未重排的旧库） */
   const uid = Number(e?.uid);
-  if (Number.isFinite(uid) && uid >= PLOT_UID_BASE && uid <= PLOT_UID_BASE + 999) return true;
-  const cm = String(e?.comment || '');
-  return /\[Y\d-\d{3}\]/.test(cm) && /第\d+章/.test(cm);
+  if (Number.isFinite(uid) && uid >= PLOT_UID_BASE && uid <= PLOT_UID_BASE + 9999) return true;
+  return false;
 }
 function entryChapter(e) {
-  /* 优先读 comment 里明写的「第N章」——那是显式章号，不依赖 uid 基准约定。
-     uid 只在没有文字章号时作回退（900000 → 第1章）。 */
-  const m = /第(\d+)章/.exec(String(e?.comment || e?.name || ''));
+  /* 章号一律从文字里读，绝不用 uid 推算 —— uid 会被重排，推出来必错。 */
+  const m = /第(\d+)章/.exec(entryText(e));
   if (m) { const n = Number(m[1]); if (n >= 1 && n <= 9999) return n; }
-  const uid = Number(e?.uid);
-  if (Number.isFinite(uid) && uid >= PLOT_UID_BASE && uid <= PLOT_UID_BASE + 999) return uid - PLOT_UID_BASE + 1;
   return null;
+}
+/* 【新增 v1.34】为一个条目生成全部可能的标识键。
+   update_fn 收到的 entry 与我们读到的 entry 未必是同一批对象：
+   uid 可能被重排、name/comment 可能分布在任意字段、entry 甚至可能不带 uid。
+   所以匹配不能只赌一个键，要把所有能想到的键都列出来求交集。 */
+function entryKeys(e) {
+  const ks = [];
+  if (!e) return ks;
+  if (e.uid != null && e.uid !== '') {
+    ks.push('u:' + String(e.uid));
+    const n = Number(e.uid);
+    if (Number.isFinite(n)) ks.push('u:' + String(n));
+  }
+  const nm = String(e.name || e.comment || e.entryName || e.key || '').trim();
+  if (nm) { ks.push('n:' + nm); ks.push('n:' + nm.slice(0, 40)); }
+  const cm = String(e.comment || '').trim();
+  if (cm) ks.push('c:' + cm);
+  const ch = entryChapter(e);
+  if (ch != null) ks.push('ch:' + ch);
+  return ks;
+}
+/* 从「目标描述」生成标识键集合（与 entryKeys 同构） */
+function targetKeys(t) {
+  const ks = [];
+  if (!t) return ks;
+  if (t.uid != null && t.uid !== '') {
+    ks.push('u:' + String(t.uid));
+    const n = Number(t.uid);
+    if (Number.isFinite(n)) ks.push('u:' + String(n));
+  }
+  const nm = String(t.name || t.comment || '').trim();
+  if (nm) { ks.push('n:' + nm); ks.push('n:' + nm.slice(0, 40)); }
+  const cm = String(t.comment || '').trim();
+  if (cm) ks.push('c:' + cm);
+  if (t.ch != null) ks.push('ch:' + t.ch);
+  return ks;
+}
+/* 两个键集合是否有交集。章号键单独处理：只在双方都是剧情条目时才认，
+   否则「第1章」这种泛用字样可能误伤同名普通条目。 */
+function keysHit(a, b, allowCh) {
+  for (const k of a) {
+    if (!allowCh && k.indexOf('ch:') === 0) continue;
+    if (b.indexOf(k) >= 0) return true;
+  }
+  return false;
 }
 
 /* 读一次世界书并【实际试写】探测写入能力，结果缓存 30 秒 */
@@ -2747,15 +2854,26 @@ async function wbApplyChapter(ch, range) {
   const nm = wbCurrentName() || p.name;
   const wantMap = {};
   const nameMap = {};
+  /* 【修 v1.34】主通道改用 targets（多键匹配）：
+     携带 uid + name + comment + 章号，任一键命中即认定同一条目。
+     uid 在导入后必被重排，只按 uid 匹配会一条都改不动。 */
+  const targets = [];
   for (const it of changed) {
     wantMap[String(it.uid)] = it.enable;
-    /* uid 优先，名称兜底：万一 uid 对不上（导入重排、跨版本变化），
-       还能按条目名命中，不至于一条都改不动。 */
     const k = String(it.name || '').trim();
     if (k) nameMap[k] = it.enable;
+    targets.push({
+      uid: it.uid,
+      name: String(it.name || ''),
+      comment: String(it.e?.comment || ''),
+      ch: it.ch,
+      on: it.enable,
+    });
   }
   if (nm && thHas('updateWorldbookWith')) {
-    const r = await thWrite(nm, wantMap, { nameMap });
+    /* 只传 targets：wantMap/nameMap 同时传会造成「A 的 uid + B 的名字」
+       这类跨条目串匹配，多条改动时极易误伤。 */
+    const r = await thWrite(nm, null, { targets });
     if (r.ok) { apiOk = true; src = r.via || 'TavernHelper.updateWorldbookWith'; }
     else tried.push('TH:' + r.err);
   } else if (!nm) tried.push('拿不到世界书名，TH 写入跳过');
