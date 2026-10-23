@@ -310,7 +310,7 @@ function stEventTypes() {
 }
 
 const EXT_ID = 'hp-deeplore';
-const EXT_VER = 'v1.31.0';
+const EXT_VER = 'v1.32.0';
 const EXT_NAME = 'HP DeepLore';
 const DB_NAME = 'hp_deeplore';
 const DB_VER = 2;   /* 【修 v1.28】+1：新增 settings store，用于配置兜底存储 */
@@ -2162,6 +2162,85 @@ async function thWrite(name, wantMap) {
   }
 }
 
+/* 判定"不能拿来试写"的条目：变量初始化、全局铁律、控制器这类，
+   一旦被临时改动又没还原，整轮生成都会跑偏。试写只碰普通条目。 */
+function isCriticalEntry(e) {
+  const s = String(e?.name || '') + ' ' + String(e?.comment || '');
+  return /\[?\s*(initvar|mvu|mvu_update|system|system_|控制器|触发器|总览|铁律|全局变量|变量列表)/i.test(s)
+    || /变量初始化/.test(s);
+}
+
+/* 【修 v1.32】真的"往返"试写一次：改 → 重读 → 还原 → 再读。
+   旧探针只调 wbWriteBack（走 /worldinfo/edit），TH 通道明明可用却没走，
+   于是 TH 环境下必然撞 CSRF 403，面板显示"写入能力 ❌"——实际 TH 那条路是通的。
+   而且旧探针只验证"接口没报错"，验证不了"刷新后还在不在"；
+   往返能把"改了没落盘"这种假成功直接测出来。 */
+async function wbProbeWriteRoundTrip(name, entries) {
+  const nm = String(name || '').trim();
+  if (!nm) return { ok: false, err: '拿不到世界书名，无法试写' };
+  const list = Array.isArray(entries) ? entries : [];
+  /* 先用剧情条目试（数量多、临时改动影响小），且优先挑当前是禁用的：
+     万一还原失败，多启用一条剧情条目，也比误关掉一条要害条目轻。 */
+  const pick =
+    list.find(e => isPlotEntry(e) && !isCriticalEntry(e) && entryIsEnabled(e) === false) ||
+    list.find(e => isPlotEntry(e) && !isCriticalEntry(e)) ||
+    list.find(e => !isCriticalEntry(e));
+  if (!pick) return { ok: false, err: '找不到可安全试写的条目（全是要害条目）' };
+
+  if (thHas('updateWorldbookWith')) {
+    const uid = String(pick.uid), orig = entryIsEnabled(pick);
+    let flipped = null, restored = null, err = '';
+    try {
+      /* 【修 v1.32】thWrite 失败是「返回 ok:false」而不是抛异常，
+         只看 catch 会漏掉真实原因，最后报成含糊的"写入未生效"。 */
+      const r1 = await thWrite(nm, { [uid]: !orig });
+      if (r1 && r1.ok === false) err = err || String(r1.err || 'TH 写入失败（未给出原因）');
+      const a = await wbReadAny(nm);
+      const now = ((a && a.entries) || []).find(e => String(e.uid) === uid);
+      flipped = now ? entryIsEnabled(now) : null;
+    } catch (e) { err = err || String(e?.message || e); }
+    /* 无论前面成败，都尽力还原 */
+    try {
+      const r2 = await thWrite(nm, { [uid]: !!orig });
+      if (r2 && r2.ok === false) err = err || String(r2.err || 'TH 还原失败（未给出原因）');
+      const b = await wbReadAny(nm);
+      const back = ((b && b.entries) || []).find(e => String(e.uid) === uid);
+      restored = back ? entryIsEnabled(back) : null;
+    } catch (e2) { err = err || String(e2?.message || e2); }
+
+    if (err) return { ok: false, err: 'TH 写入异常：' + err };
+    if (restored !== !!orig) {
+      return {
+        ok: false,
+        err: `往返还原失败（uid=${uid} 现在为 ${restored}，应为 ${!!orig}）——请手动检查该条目`,
+      };
+    }
+    if (flipped !== !orig) {
+      return {
+        ok: false,
+        err: `写入未生效（uid=${uid} 改后仍为 ${flipped}，期望 ${!orig}）——多半是没落盘`,
+      };
+    }
+    return {
+      ok: true,
+      via: `TavernHelper.updateWorldbookWith（往返实测：关闭↔启用→重读→还原，均成功；试写条目 uid=${uid}）`,
+    };
+  }
+
+  /* TH 不可用：退回 API 全量写回（可能撞 CSRF 403，如实报告） */
+  try {
+    await wbWriteBack(nm, list);
+    let via = 'api:/worldinfo/edit';
+    try {
+      const ps = await wbPersist();
+      if (ps.saved) via += ' + saveWorldInfo(' + ps.via + ')';
+    } catch (e) { /* 忽略 */ }
+    return { ok: true, via: via + '（未做往返，验证不到"刷新后是否还在"）' };
+  } catch (e) {
+    return { ok: false, err: String(e?.message || e) };
+  }
+}
+
 /* 统一读「是否启用」。
    TH 用 enabled（true=启用），ST 原生 JSON 用 disable（true=禁用），语义相反。
    【修 v1.31】两套字段都在时，不能简单"以 enabled 为准"：
@@ -2548,14 +2627,13 @@ async function wbProbe(force, opt) {
      只在用户主动点「检测世界书」时做（opt.noWrite 为空）；
      wbApplyChapter 内部紧接着就要真写，跳过试写以免多写一次。 */
   if (opt.noWrite) { out.writeOk = null; out.writeVia = '（本次跳过试写）'; __wbProbe = out; return out; }
+  /* 【修 v1.32】走与 wbApplyChapter 一致的通道优先级：TH 优先，API 兜底。
+     旧代码这里直接调 wbWriteBack，绕开了 TH，导致 TH 环境下必然误报 ❌。 */
   try {
     const nm = wbCurrentName() || out.name;
-    if (nm) {
-      await wbWriteBack(nm, entries);
-      out.writeOk = true; out.writeVia = 'api:/worldinfo/edit';
-      const ps = await wbPersist();
-      if (ps.saved) out.writeVia += ' + saveWorldInfo(' + ps.via + ')';
-    } else out.writeErr = '拿不到世界书名，无法试写';
+    const rt = await wbProbeWriteRoundTrip(nm, entries);
+    if (rt.ok) { out.writeOk = true; out.writeVia = rt.via; }
+    else { out.writeOk = false; out.writeErr = rt.err || '试写失败'; }
   } catch (e) { out.writeOk = false; out.writeErr = String(e?.message || e); }
   __wbProbe = out;
   return out;
