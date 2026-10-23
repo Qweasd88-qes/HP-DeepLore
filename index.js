@@ -2074,7 +2074,7 @@ let __wbProbe = { at: 0, ok: false, name: '', count: 0, plotCount: 0, writeOk: f
    ST 1.1.9 的世界书条目集合是 { [uid:string]: entry } 字典，不是数组。
    但不同版本/不同挂载点还可能给数组、{entries:...} 等形态，
    插件内部一律统一成「每项都带 uid 的数组」，写回时再还原成字典。 */
-function looksLikeEntry(x) {
+function looksLikeEntry(x) {   /* v1.27 原版：世界书读取归一化专用，勿改名 */
   return !!x && typeof x === 'object' && !Array.isArray(x)
     && ('content' in x || 'comment' in x || 'key' in x || 'disable' in x || 'enabled' in x || 'uid' in x);
 }
@@ -2724,7 +2724,7 @@ function dumpArgShape(arg) {
    注意：世界书容器也带 name（书名！），只凭 name 判断会把它当成条目，
    于是整本书被当成"一条不用改的条目"原样返回 —— 改动全部落空。
    所以 name 必须与 content/comment 等条目专属字段同时出现才算条目。 */
-function looksLikeEntry(o) {
+function argLooksLikeEntry(o) {   /* 【修 v1.37】原名与 v1.27 的 looksLikeEntry 撞车，覆盖了读取归一化用的原版 */
   if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
   if (o.uid != null) return true;
   if (o.key != null || o.entryName != null) return true;
@@ -2756,12 +2756,12 @@ function adaptEntryFn(fnEntry, onShape) {
       }
     }
     /* A：单条（放在容器判断之后：容器也带 name，先判单条会误吞） */
-    if (looksLikeEntry(arg)) return fnEntry(arg);
+    if (argLooksLikeEntry(arg)) return fnEntry(arg);
     /* B-2：数组 */
     if (Array.isArray(arg)) {
       let touched = false;
       const arr = arg.map(x => {
-        if (!looksLikeEntry(x)) return x;
+        if (!argLooksLikeEntry(x)) return x;
         const r = fnEntry(x);
         if (r !== x) touched = true;
         return r;
@@ -2772,11 +2772,11 @@ function adaptEntryFn(fnEntry, onShape) {
     if (typeof arg === 'object') {
       const ks = Object.keys(arg);
       if (!ks.length) return arg;
-      if (!ks.slice(0, 5).every(k => looksLikeEntry(arg[k]))) return arg;
+      if (!ks.slice(0, 5).every(k => argLooksLikeEntry(arg[k]))) return arg;
       let touched = false; const out = {};
       for (const k of ks) {
         const v = arg[k];
-        if (!looksLikeEntry(v)) { out[k] = v; continue; }
+        if (!argLooksLikeEntry(v)) { out[k] = v; continue; }
         const r = fnEntry(v);
         if (r !== v) touched = true;
         out[k] = r;
@@ -6477,13 +6477,34 @@ function renderSettingsInto(host) {
       host.querySelectorAll('.hp-nv').forEach(x => x.classList.remove('on'));
       n.classList.add('on');
       UI.panelTab = Number(n.dataset.p);
-      host.querySelector('#hp-pane-host').innerHTML = paneHTML(UI.panelTab);
-      bindPane(host);
+      safeRenderPane(host, host.querySelector('#hp-pane-host'), UI.panelTab);
     };
   });
   const ph = host.querySelector('#hp-pane-host');
-  ph.innerHTML = paneHTML(UI.panelTab);
-  bindPane(host);
+  safeRenderPane(host, ph, UI.panelTab);
+}
+
+/* 【修 v1.37】单个面板渲染出错时，旧代码会让整个设置页变成空白且静默无提示。
+   现在：出错只影响当前这一页，错误原文直接显示在页面上，其余页照常可用。 */
+function safeRenderPane(host, ph, tab) {
+  const nm = (typeof PANES !== 'undefined' && PANES[tab]) ? PANES[tab] : ('第' + tab + '页');
+  try {
+    ph.innerHTML = paneHTML(tab);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    console.error('[HP-DeepLore] paneHTML 渲染失败 tab=' + tab, e);
+    try {
+      ph.innerHTML = '<div style="padding:14px;line-height:1.7;color:#ff8a8a">'
+        + '「' + String(nm).replace(/[<>&]/g, '') + '」页渲染失败：<br>' + msg.replace(/[<>&]/g, '')
+        + '<br><br>其余页面不受影响，可正常切换。</div>';
+    } catch (_) { /* 忽略 */ }
+    return;
+  }
+  try {
+    bindPane(host);
+  } catch (e) {
+    console.error('[HP-DeepLore] bindPane 绑定失败 tab=' + tab, e);
+  }
 }
 
 /* 节点面板渲染到指定容器 */

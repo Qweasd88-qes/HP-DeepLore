@@ -1,7 +1,7 @@
 {
   "name": "HP-DeepLore",
   "id": "hp-deeplore",
-  "version": "1.36.0",
+  "version": "1.37.0",
   "description": "《HP贵族》原著深度素材插件：按时间线与角色档位检索原文、推断情绪、注入画像、审查认知边界；永久记忆接入情绪/台词/德拉科细化。全部数据本地存储。",
   "author": "StageDog",
   "manifest_version": 3,
