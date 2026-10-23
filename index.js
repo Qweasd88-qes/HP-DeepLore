@@ -310,7 +310,7 @@ function stEventTypes() {
 }
 
 const EXT_ID = 'hp-deeplore';
-const EXT_VER = 'v1.29.0';
+const EXT_VER = 'v1.31.0';
 const EXT_NAME = 'HP DeepLore';
 const DB_NAME = 'hp_deeplore';
 const DB_VER = 2;   /* 【修 v1.28】+1：新增 settings store，用于配置兜底存储 */
@@ -2076,7 +2076,120 @@ let __wbProbe = { at: 0, ok: false, name: '', count: 0, plotCount: 0, writeOk: f
    插件内部一律统一成「每项都带 uid 的数组」，写回时再还原成字典。 */
 function looksLikeEntry(x) {
   return !!x && typeof x === 'object' && !Array.isArray(x)
-    && ('content' in x || 'comment' in x || 'key' in x || 'disable' in x || 'uid' in x);
+    && ('content' in x || 'comment' in x || 'key' in x || 'disable' in x || 'enabled' in x || 'uid' in x);
+}
+
+/* ==========================================================================
+   【新增 v1.30】TavernHelper 世界书通道
+   TH 的 WorldbookEntry 用 enabled（true=启用），与 ST 原生 JSON 的 disable（true=禁用）语义相反。
+   内部统一按「enabled」读写，落到各通道时再翻译，避免把字段写反导致整本变关。
+   ========================================================================== */
+function thGet() {
+  try {
+    const t = (typeof window !== 'undefined') ? (window.TavernHelper || window.TH) : null;
+    return (t && typeof t === 'object') ? t : null;
+  } catch (e) { return null; }
+}
+function thHas(prop) {
+  const t = thGet();
+  return !!(t && typeof t[prop] === 'function');
+}
+/* 读：TH 返回 WorldbookEntry[]，带 enabled */
+async function thRead(name) {
+  const t = thGet();
+  if (!t || typeof t.getWorldbook !== 'function') return null;
+  const arr = await t.getWorldbook(name);
+  const list = Array.isArray(arr) ? arr : (arr && Array.isArray(arr.entries) ? arr.entries : null);
+  if (!list || !list.length) return null;
+  /* 补 uid：TH 一定有，但保险起见缺失时按下标生成并标注 */
+  const out = [];
+  list.forEach((e, i) => {
+    if (!looksLikeEntry(e)) return;
+    if (e.uid == null) e.uid = '__th' + i;
+    out.push(e);
+  });
+  return out.length ? out : null;
+}
+/* 列名：getWorldbookNames() */
+async function thListNames() {
+  const t = thGet();
+  if (!t || typeof t.getWorldbookNames !== 'function') return [];
+  try {
+    const r = await t.getWorldbookNames();
+    if (!Array.isArray(r)) return [];
+    return r.map(x => (x && typeof x === 'object') ? String(x.name || '') : String(x)).filter(Boolean).filter(s => !/^\d+$/.test(s));
+  } catch (e) { return []; }
+}
+/* 写：updateWorldbookWith 局部更新 —— 只改目标 uid，其余返回原 entry 保持不动 */
+async function thWrite(name, wantMap) {
+  /* wantMap: { [uid]: true/false } —— 只含需要改动的条目 */
+  const t = thGet();
+  if (!t || typeof t.updateWorldbookWith !== 'function') return { ok: false, err: 'updateWorldbookWith 不可用' };
+  const uids = Object.keys(wantMap);
+  if (!uids.length) return { ok: true, changed: 0, via: 'TavernHelper.updateWorldbookWith（无需改动）' };
+  let n = 0;
+  try {
+    await t.updateWorldbookWith(name, function (entry) {
+      if (entry == null) return entry;
+      const key = String(entry.uid);
+      if (!(key in wantMap)) return entry;          // 不匹配的条目原样返回，绝不动
+      const on = !!wantMap[key];
+      n++;
+      const out = Object.assign({}, entry, { enabled: on });
+      /* 双写 disable 保持语义一致：ST 内部与导出 JSON 读的是它，
+         两套字段同时存在且语义相同，任一体系读到的结果都正确。 */
+      try { out.disable = !on; } catch (e) { /* 冻结对象则跳过 */ }
+      return out;
+    }, { render: 'debounced' });
+    return { ok: true, changed: n, via: 'TavernHelper.updateWorldbookWith' };
+  } catch (e) {
+    /* 三参可能被老版本拒绝，退回两参再试一次 */
+    try {
+      n = 0;
+      await t.updateWorldbookWith(name, function (entry) {
+        if (entry == null) return entry;
+        const key = String(entry.uid);
+        if (!(key in wantMap)) return entry;
+        const on = !!wantMap[key]; n++;
+        const out = Object.assign({}, entry, { enabled: on });
+        try { out.disable = !on; } catch (e2) { /* 忽略 */ }
+        return out;
+      });
+      return { ok: true, changed: n, via: 'TavernHelper.updateWorldbookWith(2参)' };
+    } catch (e2) {
+      return { ok: false, err: String(e2?.message || e2) };
+    }
+  }
+}
+
+/* 统一读「是否启用」。
+   TH 用 enabled（true=启用），ST 原生 JSON 用 disable（true=禁用），语义相反。
+   【修 v1.31】两套字段都在时，不能简单"以 enabled 为准"：
+   用户在 ST 面板里手动禁用一条，只改 disable，而插件之前写过 enabled，
+   此时以 enabled 为准会读回旧值、把手动改动当成没发生（复检漏判）。
+   故采取保守策略 —— 任一字段表示"禁用"就判为禁用，宁可多改一次。 */
+function entryIsEnabled(e) {
+  if (!e) return null;
+  const en = typeof e.enabled === 'boolean' ? e.enabled : null;
+  const di = typeof e.disable === 'boolean' ? !e.disable : null;
+  if (en !== null && di !== null) return en && di;   // 两套都在：任一说禁用即禁用
+  if (en !== null) return en;
+  if (di !== null) return di;
+  return null;
+}
+/* 统一写「启用/禁用」：两套字段都写且语义一致 */
+function setEntryEnabled(e, on) {
+  try { e.enabled = !!on; } catch (_) { /* 冻结对象 */ }
+  try { e.disable = !on; } catch (_) { /* 同上 */ }
+  return e;
+}
+/* 是否需要修正。除了"当前状态≠目标状态"，还要处理两套字段都在却语义相反的情况：
+   此时 entryIsEnabled 以 enabled 为准可能"看起来已对"，但 disable 是错的，
+   ST 原生读出来仍是反的 —— 必须一并改写，否则会出现"写入成功但状态没变"。 */
+function entryNeedFix(e, wantOn) {
+  const cur = entryIsEnabled(e);
+  if (cur !== wantOn) return true;
+  return typeof e?.enabled === 'boolean' && typeof e?.disable === 'boolean' && e.enabled === e.disable;
 }
 /* 从任意形态里挖出条目字典/数组，返回 {[uid]: entry} 或 null */
 function findEntriesMap(raw, depth) {
@@ -2123,6 +2236,24 @@ function toEntriesDict(arr) {
     d[uid] = e;
   });
   return d;
+}
+
+/* 统一读取入口：TavernHelper > context 内存 > API。
+   TH 是异步的，所以提供 async 版本；wbReadLive() 保留同步语义（只走内存） */
+async function wbReadAny(name) {
+  const nm = String(name || '').trim() || wbCurrentName() || '';
+  if (nm && thHas('getWorldbook')) {
+    try {
+      const arr = await thRead(nm);
+      if (arr) return { entries: arr, src: 'TavernHelper.getWorldbook', th: true };
+    } catch (e) { /* 落到内存/API */ }
+  }
+  const live = wbReadLive();
+  if (live) return live;
+  if (nm) {
+    try { return { entries: await wbFetch(nm), src: 'api:/worldinfo/get' }; } catch (e) { /* 忽略 */ }
+  }
+  return null;
 }
 
 /* 从 ST 各种已知挂载点取世界书条目列表 */
@@ -2265,6 +2396,11 @@ async function stPost(path, body) {
 
 /* 列出所有世界书名：自动探测拿不到名字时的兜底 */
 async function wbListNames() {
+  /* 【v1.30】TH 优先：getWorldbookNames() 直接给真实名字列表 */
+  if (thHas('getWorldbookNames')) {
+    const ns = await thListNames();
+    if (ns.length) { wbListNames.lastVia = 'TavernHelper.getWorldbookNames'; return ns; }
+  }
   try {
     const { json } = await stPost('/api/worldinfo/list', {});
     const pool = [];
@@ -2347,9 +2483,19 @@ async function wbProbe(force, opt) {
     writeOk: false, writeVia: '', src: '', err: '', sample: [], nameSrc: '', writeErr: '',
   };
   let entries = null, src = '';
-  const live = wbReadLive();
-  if (live) { entries = live.entries; src = live.src; }
-  else {
+  out.th = { present: thGet() !== null, read: thHas('getWorldbook'), write: thHas('updateWorldbookWith'), names: thHas('getWorldbookNames') };
+  /* 【修 v1.31】TH 优先读取：getWorldbook 直接返回带 enabled 的 WorldbookEntry[] */
+  try {
+    const any = await wbReadAny(wbCurrentName());
+    if (any && any.entries && any.entries.length) { entries = any.entries; src = any.src; out.name = out.name || wbCurrentName() || ''; }
+  } catch (e) { /* 落到内存/API */ }
+  if (!entries || !entries.length) {
+    entries = null; src = '';
+    const live = wbReadLive();
+    if (live) { entries = live.entries; src = live.src; }
+  }
+  if (!entries || !entries.length) {
+    entries = null;
     let nm = wbCurrentName();
     if (!nm) {
       const ns = await wbListNames();
@@ -2376,12 +2522,27 @@ async function wbProbe(force, opt) {
   out.name = out.name || wbCurrentName() || '';
   out.nameSrc = String(settings?.plotWorldbookName || '').trim() ? '手动指定' : (out.name ? '自动探测' : '');
   out.plotCount = entries.filter(isPlotEntry).length;
-  /* 样例：确认数据结构契约——有没有 uid、disable 是什么类型 */
+  /* 样例：确认数据结构契约——uid 是什么类型、enabled/disable 语义是否一致 */
   out.sample = entries.slice(0, 3).map(e => ({
     uid: e?.uid, typeUid: typeof e?.uid,
+    enabled: e?.enabled, typeEnabled: typeof e?.enabled,
     disable: e?.disable, typeDisable: typeof e?.disable,
     comment: String(e?.comment || e?.name || '').slice(0, 28),
   }));
+  /* 【v1.31】契约体检：两套字段若同时存在且语义相反，写入会把开关写反 */
+  const both = entries.filter(e => typeof e?.enabled === 'boolean' && typeof e?.disable === 'boolean');
+  const conflict = both.filter(e => e.enabled === e.disable).length;
+  out.contract = {
+    total: entries.length,
+    hasEnabled: entries.filter(e => typeof e?.enabled === 'boolean').length,
+    hasDisable: entries.filter(e => typeof e?.disable === 'boolean').length,
+    both: both.length,
+    conflict,
+  };
+  if (conflict) {
+    out.contract.warn = `有 ${conflict} 条 enable/disable 语义相反（enabled===disable），`
+      + `写入时会被统一修正；若发现条目全变关闭，多半是它。`;
+  }
   /* 【修 v1.27】真的试写一次：把原样数据回写，看接口收不收。
      不改任何 disable，只是验证「这个结构能被接受且能落盘」。
      只在用户主动点「检测世界书」时做（opt.noWrite 为空）；
@@ -2407,11 +2568,14 @@ async function wbApplyChapter(ch, range) {
   const p = await wbProbe(true, { noWrite: true });
   if (!p.ok) return { ok: false, changed: 0, list: [], err: p.err || '读不到世界书' };
 
-  /* 内存优先：context 里有就直接改内存里的对象（改完还得落盘） */
-  const live = wbReadLive();
+  /* 【修 v1.31】读取统一走 wbReadAny：TH getWorldbook > context 内存 > API。
+     旧代码只走同步的 wbReadLive()，TH 的异步通道完全没用上。 */
+  const got = await wbReadAny(wbCurrentName() || p.name);
   let entries;
-  if (live) entries = live.entries;
-  else {
+  if (got && got.entries && got.entries.length) {
+    entries = got.entries;
+    if (got.src && got.src.startsWith('TavernHelper')) p.src = got.src;
+  } else {
     const nm = wbCurrentName() || p.name;
     if (!nm) return { ok: false, changed: 0, list: [], err: '拿不到世界书名，无法读取条目' };
     try { entries = await wbFetch(nm); } catch (e) { return { ok: false, changed: 0, list: [], err: '读取失败：' + e.message }; }
@@ -2426,10 +2590,14 @@ async function wbApplyChapter(ch, range) {
     const ec = entryChapter(e);
     if (ec == null) { skipped++; continue; }
     touched++;
-    const want = (ec >= lo && ec <= hi) ? false : true;   // disable: 范围内=false(启用)
-    if (!!e.disable === want) continue;                   // 已是目标状态
-    e.disable = want;
-    changed.push({ uid: e.uid, ch: ec, disable: want, e, name: entryName(e) });
+    /* 【修 v1.31】统一按「启用」语义判断，不再只认 disable。
+       旧写法在 TH 体系（只有 enabled、没有 disable）下会误判：
+       e.disable 是 undefined → !!undefined === false → 范围内要启用时
+       被当成"已是目标状态"直接跳过，结果一条都没改。 */
+    const wantOn = (ec >= lo && ec <= hi);      // 范围内 = 启用
+    if (!entryNeedFix(e, wantOn)) continue;      // 已是目标状态且无字段冲突
+    setEntryEnabled(e, wantOn);                 // enabled/disable 双写且语义一致
+    changed.push({ uid: e.uid, ch: ec, enable: wantOn, e, name: entryName(e) });
   }
 
   /* 无需改动：直接算成功，但要把"扫了多少条"说清楚，便于判断识别是否正常 */
@@ -2441,13 +2609,29 @@ async function wbApplyChapter(ch, range) {
     };
   }
 
-  /* 写回：① API（真正落盘）→ ② Slash 命令（原生 UI 通道） */
+  /* 写回：① TavernHelper.updateWorldbookWith（局部更新，只改目标 uid）
+         → ② API /worldinfo/edit（全量覆盖）
+         → ③ Slash 命令（原生 UI 通道）
+     【修 v1.31】TH 提到最优先。理由：updateWorldbookWith 是单条/少量修改的
+     首选方案，不匹配的条目原样返回、完全不受影响；而 /worldinfo/edit 是
+     全量覆盖，若其他条目在此期间被别处改动会被覆盖，有误伤风险。
+     旧代码 TH 通道写了却没接进这里，等于白写。 */
   let apiOk = false, src = ''; const tried = [];
-  try {
-    const nm = wbCurrentName() || p.name;
-    if (nm) { await wbWriteBack(nm, entries); apiOk = true; src = 'api:/worldinfo/edit'; }
-    else tried.push('拿不到世界书名，API 写入跳过');
-  } catch (e) { tried.push('API:' + e.message); }
+  const nm = wbCurrentName() || p.name;
+  const wantMap = {};
+  for (const it of changed) wantMap[String(it.uid)] = it.enable;
+  if (nm && thHas('updateWorldbookWith')) {
+    const r = await thWrite(nm, wantMap);
+    if (r.ok) { apiOk = true; src = r.via || 'TavernHelper.updateWorldbookWith'; }
+    else tried.push('TH:' + r.err);
+  } else if (!nm) tried.push('拿不到世界书名，TH 写入跳过');
+  else tried.push('TH:updateWorldbookWith 不可用');
+  if (!apiOk) {
+    try {
+      if (nm) { await wbWriteBack(nm, entries); apiOk = true; src = 'api:/worldinfo/edit'; }
+      else tried.push('拿不到世界书名，API 写入跳过');
+    } catch (e) { tried.push('API:' + e.message); }
+  }
   /* 落盘：API 改的是服务端数据；内存对象已改，再让 ST 存一次确保一致 */
   let saved = false;
   try {
@@ -2463,7 +2647,7 @@ async function wbApplyChapter(ch, range) {
     if (sp.has) {
       for (const it of changed) {
         if (!it.name) continue;
-        const r = await wbSlashSetEntry(it.name, !it.disable);
+        const r = await wbSlashSetEntry(it.name, !!it.enable);
         if (r.ok) slashUsed++; else if (!slashErr) slashErr = r.err || '命令未生效';
       }
       if (slashUsed) { src = (src ? src + ' + ' : '') + `Slash 命令(${slashUsed} 条)`; }
@@ -2485,26 +2669,39 @@ async function wbApplyChapter(ch, range) {
 /* 复检：重新读一次，确认目标章真的处于启用状态（对应验收"刷新后保持"） */
 async function wbVerify(ch, range) {
   try {
-    const live = wbReadLive();
-    let entries;
-    if (live) entries = live.entries;
-    else {
-      const nm = wbCurrentName();
-      if (!nm) return { ok: false, err: '拿不到世界书名', on: [], off: [] };
-      entries = await wbFetch(nm);
+    /* 【修 v1.31】复检走真实读取通道（TH 优先），不再只看同步内存——
+       内存改了但没落盘的话，旧写法会误报"复检通过"。 */
+    const nm = wbCurrentName();
+    let entries = null;
+    try {
+      const any = await wbReadAny(nm);
+      if (any && any.entries && any.entries.length) entries = any.entries;
+    } catch (e) { /* 忽略 */ }
+    if (!entries || !entries.length) {
+      const live = wbReadLive();
+      if (live) entries = live.entries;
+      else {
+        if (!nm) return { ok: false, err: '拿不到世界书名', on: [], bad: [], off: [] };
+        entries = await wbFetch(nm);
+      }
     }
     const lo = ch - range, hi = ch + range;
-    const on = [], bad = [];
+    const on = [], off = [], bad = [];
     for (const e of entries) {
       if (!isPlotEntry(e)) continue;
       const ec = entryChapter(e);
       if (ec == null) continue;
       const inRange = ec >= lo && ec <= hi;
-      if (inRange) { if (e.disable) bad.push(ec); else on.push(ec); }
-      else if (!e.disable) bad.push(ec);
+      const isOn = entryIsEnabled(e);
+      if (inRange) { if (isOn === false) bad.push(ec); else on.push(ec); }
+      else { if (isOn === true) bad.push(ec); else off.push(ec); }
     }
-    return { ok: bad.length === 0, on: on.sort((a, b) => a - b), bad, err: bad.length ? `状态不符的章：${bad.join(',')}` : '' };
-  } catch (e) { return { ok: false, err: String(e?.message || e), on: [], bad: [] }; }
+    return {
+      ok: bad.length === 0,
+      on: on.sort((a, b) => a - b), off: off.length, bad,
+      err: bad.length ? `状态不符的章：${bad.join(',')}` : '',
+    };
+  } catch (e) { return { ok: false, err: String(e?.message || e), on: [], bad: [], off: [] }; }
 }
 
 /* 条目名字（用于 Slash 命令） */
@@ -5155,16 +5352,32 @@ function bindPane(host) {
         return;
       }
 
-      /* 数据结构契约样例：确认是 {uid: entry} 字典、uid/disable 类型对不对 */
+      /* 数据结构契约样例：确认 uid 类型、enabled/disable 语义是否一致 */
       const smp = (p.sample || []).map((s, i) =>
-        `  ${i + 1}. uid=${s.uid}(${s.typeUid}) disable=${s.disable}(${s.typeDisable}) 「${s.comment}」`).join('\n');
+        `  ${i + 1}. uid=${s.uid}(${s.typeUid}) enabled=${s.enabled}(${s.typeEnabled}) disable=${s.disable}(${s.typeDisable}) 「${s.comment}」`).join('\n');
       const contract = (p.sample || []).length
         ? `数据结构样例（前 3 条）：\n${smp}`
         : '数据结构样例：无';
       const warn = [];
       if ((p.sample || []).some(s => s.uid == null)) warn.push('有条目没有 uid —— 写回时会被当成新条目');
-      if ((p.sample || []).some(s => s.typeDisable !== 'boolean')) warn.push('disable 不是布尔值 —— 请检查条目数据');
-      if (!p.plotCount) warn.push('没识别出剧情条目 —— 确认 273 章节点已导入，且 comment 含「第N章」');
+      if ((p.sample || []).some(s => s.typeDisable !== 'boolean' && s.typeEnabled !== 'boolean')) warn.push('enabled/disable 都不是布尔值 —— 请检查条目数据');
+      if (!p.plotCount) warn.push('没识别出剧情条目 —— 确认 272 章节点已导入，且 comment 含「第N章」');
+      const ct = p.contract || {};
+      if (ct.conflict) warn.push(ct.warn || `${ct.conflict} 条 enable/disable 语义相反`);
+      if (ct.hasEnabled === 0 && ct.hasDisable > 0 && !p.th?.read) warn.push('只有 disable 字段、没有 enabled —— 这是 ST 原生导出格式，插件按 enabled 统一处理');
+      if (ct.hasDisable === 0 && ct.hasEnabled > 0) warn.push('只有 enabled 字段 —— 这是 TavernHelper 格式，插件会自动补 disable');
+
+      /* 【v1.31】TavernHelper 通道状态：它是单条启停的首选方案 */
+      const th = p.th || {};
+      const thInfo = th.present
+        ? `TavernHelper：已装载 ✅\n`
+          + `  getWorldbook（读）：${th.read ? '可用' : '不可用'}\n`
+          + `  updateWorldbookWith（写）：${th.write ? '可用 ← 单条启停首选' : '不可用'}\n`
+          + `  getWorldbookNames（列名）：${th.names ? '可用' : '不可用'}`
+        : `TavernHelper：未检测到 ❌\n  将回退到 API /worldinfo/edit（全量覆盖）与 Slash 命令`;
+      const ctInfo = ct.total
+        ? `字段体检：共 ${ct.total} 条，含 enabled ${ct.hasEnabled} 条、含 disable ${ct.hasDisable} 条、两者都有 ${ct.both} 条${ct.conflict ? `、语义冲突 ${ct.conflict} 条` : ''}`
+        : '';
 
       out.textContent = `世界书检测成功\n`
         + `来源：${p.src}\n`
@@ -5172,6 +5385,8 @@ function bindPane(host) {
         + `总条目：${p.count}\n`
         + `剧情条目：${p.plotCount} 条\n\n`
         + contract + `\n\n`
+        + (ctInfo ? ctInfo + `\n\n` : '')
+        + thInfo + `\n\n`
         + `写入能力：${p.writeOk ? '✅ 实测可写（' + p.writeVia + '）' : '❌ ' + (p.writeErr || '试写失败')}\n\n`
         + slashInfo
         + (warn.length ? `\n\n⚠ 发现问题：\n` + warn.map(w => '  · ' + w).join('\n') : '\n\n✅ 数据结构契约对齐，未发现问题');
@@ -5208,8 +5423,8 @@ function bindPane(host) {
         return;
       }
       const a = await wbApplyChapter(r.ch, Number(settings.plotRange) || 0);
-      const en = a.list.filter(x => !x.disable).map(x => '第' + x.ch + '章').join('、');
-      const dis = a.list.filter(x => x.disable).length;
+      const en = a.list.filter(x => !!x.enable).map(x => '第' + x.ch + '章').join('、');
+      const dis = a.list.filter(x => !x.enable).length;
       let txt = `定位：第 ${r.ch} 章（${r.src}）\n理由：${r.why}\n\n`;
       if (a.ok) {
         txt += `已改动 ${a.changed} 条条目\n启用：${en || '（无需改动）'}\n禁用：${dis} 条\n写入方式：${a.src}`
@@ -6809,6 +7024,7 @@ function boot() {
         plotPaneHTML, isPlotEntry, entryChapter,
         // v1.26 Slash 命令通道
         wbSlashProbe, wbSlashRun, wbSlashSetEntry, wbCurrentName, entryName, wbReadLive,
+        wbVerify, wbReadAny, thGet, thHas, entryIsEnabled, entryNeedFix, setEntryEnabled,
       };
     } catch (e) { /* 忽略 */ }
     console.log('  · 菜单入口 : ' + (inMenu ? '✓ 已挂到魔法棒菜单' : '✗ 未找到菜单容器（已用悬浮球 ◈ 兜底）'));
