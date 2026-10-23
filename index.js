@@ -310,7 +310,7 @@ function stEventTypes() {
 }
 
 const EXT_ID = 'hp-deeplore';
-const EXT_VER = 'v1.32.0';
+const EXT_VER = 'v1.33.0';
 const EXT_NAME = 'HP DeepLore';
 const DB_NAME = 'hp_deeplore';
 const DB_VER = 2;   /* 【修 v1.28】+1：新增 settings store，用于配置兜底存储 */
@@ -2121,45 +2121,58 @@ async function thListNames() {
   } catch (e) { return []; }
 }
 /* 写：updateWorldbookWith 局部更新 —— 只改目标 uid，其余返回原 entry 保持不动 */
-async function thWrite(name, wantMap) {
-  /* wantMap: { [uid]: true/false } —— 只含需要改动的条目 */
+async function thWrite(name, wantMap, opt) {
+  /* wantMap: { [uid]: true/false } —— 只含需要改动的条目
+     opt.nameMap: { [条目名片段]: true/false } —— uid 对不上时的名称兜底
+       （导入世界书时 uid 常被 ST 重排，只按 uid 匹配会一条都改不动） */
   const t = thGet();
   if (!t || typeof t.updateWorldbookWith !== 'function') return { ok: false, err: 'updateWorldbookWith 不可用' };
-  const uids = Object.keys(wantMap);
-  if (!uids.length) return { ok: true, changed: 0, via: 'TavernHelper.updateWorldbookWith（无需改动）' };
-  let n = 0;
-  try {
-    await t.updateWorldbookWith(name, function (entry) {
-      if (entry == null) return entry;
-      const key = String(entry.uid);
-      if (!(key in wantMap)) return entry;          // 不匹配的条目原样返回，绝不动
-      const on = !!wantMap[key];
-      n++;
-      const out = Object.assign({}, entry, { enabled: on });
-      /* 双写 disable 保持语义一致：ST 内部与导出 JSON 读的是它，
-         两套字段同时存在且语义相同，任一体系读到的结果都正确。 */
-      try { out.disable = !on; } catch (e) { /* 冻结对象则跳过 */ }
-      return out;
-    }, { render: 'debounced' });
-    return { ok: true, changed: n, via: 'TavernHelper.updateWorldbookWith' };
-  } catch (e) {
-    /* 三参可能被老版本拒绝，退回两参再试一次 */
+  const uids = Object.keys(wantMap || {});
+  const nameMap = (opt && opt.nameMap) || null;
+  if (!uids.length && !nameMap) return { ok: true, changed: 0, via: 'TavernHelper.updateWorldbookWith（无需改动）' };
+
+  /* 生成 update_fn。返回的闭包自带计数器，每档尝试独立计数。 */
+  const mkFn = (counter) => function (entry) {
+    if (entry == null) return entry;
+    let on = null;
+    const key = String(entry.uid);
+    if (Object.prototype.hasOwnProperty.call(wantMap, key)) on = !!wantMap[key];
+    if (on === null && nameMap) {
+      const nmk = String(entry.name || '') + ' ' + String(entry.comment || '');
+      for (const k of Object.keys(nameMap)) {
+        if (k && nmk.indexOf(k) >= 0) { on = !!nameMap[k]; break; }
+      }
+    }
+    if (on === null) return entry;                 // 不匹配的条目原样返回，绝不动
+    counter.n++;
+    const out = Object.assign({}, entry, { enabled: on });
+    /* 双写 disable 保持语义一致：ST 内部与导出 JSON 读的是它，
+       两套字段同时存在且语义相同，任一体系读到的结果都正确。 */
+    try { out.disable = !on; } catch (e) { /* 冻结对象则跳过 */ }
+    return out;
+  };
+
+  /* 【修 v1.33】render 顺序：immediate 必须排第一。
+     旧版用了 'debounced' —— 改动被推迟到防抖窗口结束才落盘，
+     而我们写完立刻重读，读到的还是旧值，于是判定"写入未生效"。
+     这正是"改了但刷新后还原"这类问题最难查的地方：接口没报错，值却没变。 */
+  const tries = [
+    { arg: 3, render: 'immediate', tag: 'TavernHelper.updateWorldbookWith' },
+    { arg: 3, render: 'debounced', tag: 'TavernHelper.updateWorldbookWith(render=debounced)' },
+    { arg: 2, render: null, tag: 'TavernHelper.updateWorldbookWith(2参)' },
+  ];
+  let lastErr = '';
+  for (const tr of tries) {
+    const counter = { n: 0 };
     try {
-      n = 0;
-      await t.updateWorldbookWith(name, function (entry) {
-        if (entry == null) return entry;
-        const key = String(entry.uid);
-        if (!(key in wantMap)) return entry;
-        const on = !!wantMap[key]; n++;
-        const out = Object.assign({}, entry, { enabled: on });
-        try { out.disable = !on; } catch (e2) { /* 忽略 */ }
-        return out;
-      });
-      return { ok: true, changed: n, via: 'TavernHelper.updateWorldbookWith(2参)' };
-    } catch (e2) {
-      return { ok: false, err: String(e2?.message || e2) };
+      if (tr.arg === 3) await t.updateWorldbookWith(name, mkFn(counter), { render: tr.render });
+      else await t.updateWorldbookWith(name, mkFn(counter));
+      return { ok: true, changed: counter.n, render: tr.render || '(默认)', via: tr.tag };
+    } catch (e) {
+      lastErr = String(e?.message || e);
     }
   }
+  return { ok: false, err: lastErr || 'updateWorldbookWith 各档尝试均失败', changed: 0 };
 }
 
 /* 判定"不能拿来试写"的条目：变量初始化、全局铁律、控制器这类，
@@ -2168,6 +2181,25 @@ function isCriticalEntry(e) {
   const s = String(e?.name || '') + ' ' + String(e?.comment || '');
   return /\[?\s*(initvar|mvu|mvu_update|system|system_|控制器|触发器|总览|铁律|全局变量|变量列表)/i.test(s)
     || /变量初始化/.test(s);
+}
+
+/* 【新增 v1.33】轮询读取某条目的启用状态。
+   TH 的 render 防抖、ST 的 UI 重绘都可能让写入晚一拍落盘，
+   只在上一次写入后立刻读一次，会把"还没落盘"误判成"写入无效"。 */
+async function wbWaitEnabled(name, uid, expect, tries, gap) {
+  const n = Math.max(1, tries || 6);
+  const g = Math.max(0, gap == null ? 120 : gap);
+  let last = null;
+  for (let i = 0; i < n; i++) {
+    try {
+      const a = await wbReadAny(name);
+      const e = ((a && a.entries) || []).find(x => String(x.uid) === String(uid));
+      last = e ? entryIsEnabled(e) : null;
+    } catch (e) { last = null; }
+    if (last === expect) return last;
+    if (i < n - 1) await new Promise(r => setTimeout(r, g));
+  }
+  return last;
 }
 
 /* 【修 v1.32】真的"往返"试写一次：改 → 重读 → 还原 → 再读。
@@ -2189,42 +2221,59 @@ async function wbProbeWriteRoundTrip(name, entries) {
 
   if (thHas('updateWorldbookWith')) {
     const uid = String(pick.uid), orig = entryIsEnabled(pick);
-    let flipped = null, restored = null, err = '';
+    /* 名称兜底：导入世界书时 ST 常重排 uid，只按 uid 匹配会一条都改不动 */
+    const nmKey = String(pick.name || pick.comment || '').slice(0, 40);
+    const nameMap = nmKey ? { [nmKey]: !orig } : null;
+    let flipped = null, restored = null, err = '', matched = -1;
     try {
-      /* 【修 v1.32】thWrite 失败是「返回 ok:false」而不是抛异常，
+      /* 【修 v1.33】thWrite 失败是「返回 ok:false」而不是抛异常，
          只看 catch 会漏掉真实原因，最后报成含糊的"写入未生效"。 */
-      const r1 = await thWrite(nm, { [uid]: !orig });
+      const r1 = await thWrite(nm, { [uid]: !orig }, { nameMap });
       if (r1 && r1.ok === false) err = err || String(r1.err || 'TH 写入失败（未给出原因）');
-      const a = await wbReadAny(nm);
-      const now = ((a && a.entries) || []).find(e => String(e.uid) === uid);
-      flipped = now ? entryIsEnabled(now) : null;
+      if (r1 && typeof r1.changed === 'number') matched = r1.changed;
+      /* TH 的 render 有防抖，落盘可能晚一拍；立刻读一次就下结论会误判 */
+      flipped = await wbWaitEnabled(nm, uid, !orig, 6, 120);
     } catch (e) { err = err || String(e?.message || e); }
     /* 无论前面成败，都尽力还原 */
     try {
-      const r2 = await thWrite(nm, { [uid]: !!orig });
+      const r2 = await thWrite(nm, { [uid]: !!orig }, { nameMap: nmKey ? { [nmKey]: !!orig } : null });
       if (r2 && r2.ok === false) err = err || String(r2.err || 'TH 还原失败（未给出原因）');
-      const b = await wbReadAny(nm);
-      const back = ((b && b.entries) || []).find(e => String(e.uid) === uid);
-      restored = back ? entryIsEnabled(back) : null;
+      restored = await wbWaitEnabled(nm, uid, !!orig, 6, 120);
     } catch (e2) { err = err || String(e2?.message || e2); }
 
-    if (err) return { ok: false, err: 'TH 写入异常：' + err };
-    if (restored !== !!orig) {
+    let thErr = '';
+    if (err) thErr = 'TH 写入异常：' + err;
+    /* uid 一条都没匹配上：这不是"没落盘"，是匹配键错了，必须分开说，
+       否则用户会一直去查落盘，而真正的原因是导入重排。 */
+    if (!thErr && matched === 0) {
+      thErr = `updateWorldbookWith 未匹配到任何条目（uid=${uid}，条目名「${nmKey}」）——` +
+              `多半是导入时 uid 被 ST 重排；插件已尝试按名称兜底，可用「只看不改」确认实际 uid`;
+    }
+    if (!thErr && restored !== !!orig) {
+      thErr = `往返还原失败（uid=${uid} 现在为 ${restored}，应为 ${!!orig}）——请手动检查该条目`;
+    }
+    if (!thErr && flipped !== !orig) {
+      thErr = `写入未生效（uid=${uid} 改后仍为 ${flipped}，期望 ${!orig}）——已等 720ms 重读 6 次仍不变`;
+    }
+    if (!thErr) {
       return {
-        ok: false,
-        err: `往返还原失败（uid=${uid} 现在为 ${restored}，应为 ${!!orig}）——请手动检查该条目`,
+        ok: true,
+        via: `TavernHelper.updateWorldbookWith（往返实测：关闭↔启用→重读→还原，均成功；试写条目 uid=${uid}）`,
       };
     }
-    if (flipped !== !orig) {
-      return {
-        ok: false,
-        err: `写入未生效（uid=${uid} 改后仍为 ${flipped}，期望 ${!orig}）——多半是没落盘`,
-      };
+    /* TH 这条路走不通：再试一次全量写回，两路都失败才判 ❌，
+       并把两条路各自的失败原因都列出来，便于定位。 */
+    try {
+      await wbWriteBack(nm, list);
+      let via = 'api:/worldinfo/edit（全量覆盖）';
+      try {
+        const ps = await wbPersist();
+        if (ps.saved) via += ' + saveWorldInfo(' + ps.via + ')';
+      } catch (e) { /* 忽略 */ }
+      return { ok: true, via: via + `；TH 单向失败原因：${thErr}` };
+    } catch (e2) {
+      return { ok: false, err: `TH：${thErr}；API：${String(e2?.message || e2)}` };
     }
-    return {
-      ok: true,
-      via: `TavernHelper.updateWorldbookWith（往返实测：关闭↔启用→重读→还原，均成功；试写条目 uid=${uid}）`,
-    };
   }
 
   /* TH 不可用：退回 API 全量写回（可能撞 CSRF 403，如实报告） */
@@ -2697,9 +2746,16 @@ async function wbApplyChapter(ch, range) {
   let apiOk = false, src = ''; const tried = [];
   const nm = wbCurrentName() || p.name;
   const wantMap = {};
-  for (const it of changed) wantMap[String(it.uid)] = it.enable;
+  const nameMap = {};
+  for (const it of changed) {
+    wantMap[String(it.uid)] = it.enable;
+    /* uid 优先，名称兜底：万一 uid 对不上（导入重排、跨版本变化），
+       还能按条目名命中，不至于一条都改不动。 */
+    const k = String(it.name || '').trim();
+    if (k) nameMap[k] = it.enable;
+  }
   if (nm && thHas('updateWorldbookWith')) {
-    const r = await thWrite(nm, wantMap);
+    const r = await thWrite(nm, wantMap, { nameMap });
     if (r.ok) { apiOk = true; src = r.via || 'TavernHelper.updateWorldbookWith'; }
     else tried.push('TH:' + r.err);
   } else if (!nm) tried.push('拿不到世界书名，TH 写入跳过');
