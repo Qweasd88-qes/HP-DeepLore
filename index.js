@@ -310,7 +310,7 @@ function stEventTypes() {
 }
 
 const EXT_ID = 'hp-deeplore';
-const EXT_VER = 'v1.34.0';
+const EXT_VER = 'v1.35.0';
 const EXT_NAME = 'HP DeepLore';
 const DB_NAME = 'hp_deeplore';
 const DB_VER = 2;   /* 【修 v1.28】+1：新增 settings store，用于配置兜底存储 */
@@ -2245,72 +2245,15 @@ async function wbProbeWriteRoundTrip(name, entries) {
   const nm = String(name || '').trim();
   if (!nm) return { ok: false, err: '拿不到世界书名，无法试写' };
   const list = Array.isArray(entries) ? entries : [];
-  /* 先用剧情条目试（数量多、临时改动影响小），且优先挑当前是禁用的：
-     万一还原失败，多启用一条剧情条目，也比误关掉一条要害条目轻。 */
-  /* 【修 v1.34】候选不止一个：uid 重排后第一条可能匹配不上，
-     换几条再试才能区分「这一条的键特殊」和「整个匹配机制失效」。 */
-  const pool = list.filter(e => isPlotEntry(e) && !isCriticalEntry(e));
-  const cands = [];
-  const off = pool.filter(e => entryIsEnabled(e) === false);
-  const on = pool.filter(e => entryIsEnabled(e) === true);
-  for (let i = 0; i < 3; i++) { if (off[i]) cands.push(off[i]); }
-  if (!cands.length) for (let i = 0; i < 3; i++) { if (on[i]) cands.push(on[i]); }
-  if (!cands.length) {
-    const safe = list.filter(e => !isCriticalEntry(e));
-    for (let i = 0; i < 3; i++) { if (safe[i]) cands.push(safe[i]); }
-  }
-  if (!cands.length) return { ok: false, err: '找不到可安全试写的条目（全是要害条目）' };
-
+  /* 【修 v1.35】不再预先挑候选：挑哪一条由 update_fn 遍历时自己决定。
+     以前是「从我们读到的列表里取第一条」，而那份列表的 uid 在书里
+     可能根本不存在（导入重排），于是试写必然报 matched=0。 */
   if (thHas('updateWorldbookWith')) {
-    /* 【修 v1.34】逐个候选试：第一条的键可能对不上（uid 重排、名称被改写），
-       但换一条未必。只有全部候选都 matched=0，才说明匹配机制真的失效。 */
-    const attempts = [];
-    for (const pick of cands) {
-      const uid = String(pick.uid), orig = entryIsEnabled(pick);
-      const nmKey = String(pick.name || pick.comment || '').slice(0, 40);
-      const chNo = entryChapter(pick);
-      const tk = targetKeys({ uid: pick.uid, name: String(pick.name || ''), comment: String(pick.comment || ''), ch: chNo });
-      const one = [{ uid: pick.uid, name: String(pick.name || pick.comment || ''), comment: String(pick.comment || ''), ch: chNo, on: !orig }];
-      let flipped = null, restored = null, err = '', matched = -1;
-      try {
-        /* 【修 v1.33】thWrite 失败是「返回 ok:false」而不是抛异常，
-           只看 catch 会漏掉真实原因，最后报成含糊的"写入未生效"。 */
-        const r1 = await thWrite(nm, null, { targets: one });
-        if (r1 && r1.ok === false) err = err || String(r1.err || 'TH 写入失败（未给出原因）');
-        if (r1 && typeof r1.changed === 'number') matched = r1.changed;
-        /* TH 的 render 有防抖，落盘可能晚一拍；立刻读一次就下结论会误判 */
-        flipped = await wbWaitEnabled(nm, uid, !orig, 6, 120, { tKeys: tk });
-      } catch (e) { err = err || String(e?.message || e); }
-      /* 无论前面成败，都尽力还原 */
-      try {
-        const back = [{ uid: pick.uid, name: String(pick.name || pick.comment || ''), comment: String(pick.comment || ''), ch: chNo, on: !!orig }];
-        const r2 = await thWrite(nm, null, { targets: back });
-        if (r2 && r2.ok === false) err = err || String(r2.err || 'TH 还原失败（未给出原因）');
-        restored = await wbWaitEnabled(nm, uid, !!orig, 6, 120, { tKeys: tk });
-      } catch (e2) { err = err || String(e2?.message || e2); }
-
-      let thErr = '';
-      if (err) thErr = 'TH 写入异常：' + err;
-      else if (matched === 0) thErr = `未匹配到任何条目（uid=${uid}${chNo != null ? `，第${chNo}章` : ''}，条目名「${nmKey}」）`;
-      else if (restored !== !!orig) thErr = `往返还原失败（uid=${uid} 现在为 ${restored}，应为 ${!!orig}）`;
-      else if (flipped !== !orig) thErr = `写入未生效（uid=${uid} 改后仍为 ${flipped}，期望 ${!orig}）——已等 720ms 重读 6 次仍不变`;
-
-      attempts.push({ uid, nmKey, chNo, thErr, matched });
-      if (!thErr) {
-        return {
-          ok: true,
-          via: `TavernHelper.updateWorldbookWith（往返实测：关闭↔启用→重读→还原，均成功；试写条目 uid=${uid}${chNo != null ? `，第${chNo}章` : ''}）`,
-        };
-      }
-    }
-    /* 全部候选都失败：把"插件持有的 uid"与"世界书里实际的 uid"都列出来，
-       这是确认 uid 重排最直接的证据，也是用户排查的第一手材料。 */
-    const realUids = list.filter(isPlotEntry).slice(0, 3).map(e => String(e.uid)).join('/');
-    const thErr = `TH 试写 ${attempts.length} 条全部失败：` +
-      attempts.map(a => `uid=${a.uid}${a.thErr ? '（' + a.thErr + '）' : ''}`).join('；') +
-      `。插件读到剧情条目 uid 样例=${realUids || '（无）'}`;
-    /* TH 这条路走不通：再试一次全量写回，两路都失败才判 ❌，
-       并把两条路各自的失败原因都列出来，便于定位。 */
+    /* 【修 v1.35】往返试写改成自识别：翻哪一条由 update_fn 自己挑，
+       不再拿我们列表里的 uid 去书里找 —— 重排后根本找不到。 */
+    const rt = await thProbeRoundTrip(nm);
+    if (rt.ok) return { ok: true, via: rt.via, sample: rt.sample };
+    /* TH 走不通：再试一次全量写回，两路都失败才判 ❌ */
     try {
       await wbWriteBack(nm, list);
       let via = 'api:/worldinfo/edit（全量覆盖）';
@@ -2318,9 +2261,9 @@ async function wbProbeWriteRoundTrip(name, entries) {
         const ps = await wbPersist();
         if (ps.saved) via += ' + saveWorldInfo(' + ps.via + ')';
       } catch (e) { /* 忽略 */ }
-      return { ok: true, via: via + `；TH 单向失败原因：${thErr}` };
+      return { ok: true, via: via + `；TH 试写失败原因：${rt.err}`, sample: rt.sample };
     } catch (e2) {
-      return { ok: false, err: `TH：${thErr}；API：${String(e2?.message || e2)}` };
+      return { ok: false, err: `TH：${rt.err}；API：${String(e2?.message || e2)}`, sample: rt.sample };
     }
   }
 
@@ -2652,9 +2595,6 @@ function isPlotEntry(e) {
   /* 主判据：内容特征。comment 或 name 里出现「第N章」即视为剧情节点条目。
      不再要求必须同时带 [Y1-001] 前缀——导入时前缀可能被截断或改写。 */
   if (/第\d+章/.test(t)) return true;
-  /* 辅助：uid 落在 900000 区间（未重排的旧库） */
-  const uid = Number(e?.uid);
-  if (Number.isFinite(uid) && uid >= PLOT_UID_BASE && uid <= PLOT_UID_BASE + 9999) return true;
   return false;
 }
 function entryChapter(e) {
@@ -2707,6 +2647,179 @@ function keysHit(a, b, allowCh) {
     if (b.indexOf(k) >= 0) return true;
   }
   return false;
+}
+
+/* ==========================================================================
+   【新增 v1.35】规则式局部更新 —— 彻底放弃「跨对象匹配」
+
+   旧思路：本地读一份条目 → 算出哪些要改 → 拿 uid/name 去 TH 里"找同一条"。
+   这条路从根上不成立：
+     · uid 是书内索引，导入时 ST 归一化会重排（外部格式数组+id → 内部
+       对象字典+uid），插件手里的 900000 与书里的实际值毫无关系；
+     · TH 递给 update_fn 的对象，字段也可能与 getWorldbook 拿到的不同。
+   于是 matched 恒为 0，且接口不报错 —— 最难查的一类假失败。
+
+   新思路：判定全部下沉到 update_fn 内部。
+   拿到哪一条就用它自己的 name/comment 判断是不是剧情条目、第几章、该不该
+   启用，并用它自己的 uid 记录结果。不存在"两份数据对齐"这一步，
+   重排也就无从影响。
+   ========================================================================== */
+
+/* update_fn 内部用的「是否启用」判定：两套字段都没有时视为启用，不擅自漏改 */
+function entryEnabled(e) {
+  if (!e) return true;
+  if (typeof e.enabled === 'boolean') return e.enabled;
+  if (typeof e.disable === 'boolean') return !e.disable;
+  return true;
+}
+/* update_fn 收到的对象到底长什么样？以前完全看不见，只能靠猜。
+   现在把前 3 条原样记下来 —— uid 有没有、什么类型、name/comment 在不在，
+   一眼就能确认 TH 递过来的究竟是什么，这也是排查匹配失败的第一手材料。 */
+function fnSamplePush(list, entry) {
+  if (!list || list.length >= 3 || entry == null) return;
+  list.push({
+    uid: entry.uid, uidType: typeof entry.uid,
+    hasName: !!entry.name, hasComment: !!entry.comment,
+    enabled: entry.enabled, disable: entry.disable,
+    head: String(entry.name || entry.comment || entry.content || '').slice(0, 30),
+  });
+}
+
+/* 按规则批量启停。rule: {range:{lo,hi}} 或 {want:(ch)=>bool}
+   返回 {ok, changed:[{uid,ch,enabled,prev,name}], sample, stats, via, err} */
+async function thApplyByRule(nm, rule) {
+  const t = thGet();
+  const empty = { ok: false, err: 'updateWorldbookWith 不可用', changed: [], sample: [], stats: { total: 0, plot: 0, noCh: 0 } };
+  if (!t || typeof t.updateWorldbookWith !== 'function') return empty;
+  const sample = [];
+  const mkFn = (acc, stats) => function (entry) {
+    if (entry == null) return entry;
+    stats.total++;
+    fnSamplePush(sample, entry);
+    if (!isPlotEntry(entry)) return entry;
+    const ec = entryChapter(entry);
+    if (ec == null) { stats.noCh++; return entry; }
+    stats.plot++;
+    let wantOn = null;
+    if (rule && rule.range) wantOn = (ec >= rule.range.lo && ec <= rule.range.hi);
+    else if (rule && typeof rule.want === 'function') wantOn = !!rule.want(ec);
+    if (wantOn === null) return entry;
+    const cur = entryIsEnabled(entry);
+    if (cur !== null && cur === wantOn) return entry;
+    acc.push({ uid: entry.uid, ch: ec, enabled: wantOn, prev: cur, name: entryName(entry) });
+    const out = Object.assign({}, entry, { enabled: wantOn });
+    try { out.disable = !wantOn; } catch (_) { /* 冻结对象则跳过 */ }
+    return out;
+  };
+  const tries = [
+    { a: 3, render: 'immediate', tag: 'TavernHelper.updateWorldbookWith' },
+    { a: 3, render: 'debounced', tag: 'TavernHelper.updateWorldbookWith(render=debounced)' },
+    { a: 2, render: null, tag: 'TavernHelper.updateWorldbookWith(2参)' },
+  ];
+  let lastErr = '';
+  for (const tr of tries) {
+    const acc = [], stats = { total: 0, plot: 0, noCh: 0 };
+    try {
+      if (tr.a === 3) await t.updateWorldbookWith(nm, mkFn(acc, stats), { render: tr.render });
+      else await t.updateWorldbookWith(nm, mkFn(acc, stats));
+      /* update_fn 一次都没被调用：TH 根本没把条目递给我们。
+         这比"匹配不上"更根本 —— 世界书名不对、或该 TH 版本实现不同，
+         都必须如实报出来，不能当成"无需改动"蒙混过关。 */
+      if (!stats.total) { lastErr = 'update_fn 未被调用（TH 没有把任何条目递给我们）'; break; }
+      return { ok: true, changed: acc, sample, stats, via: tr.tag };
+    } catch (e) { lastErr = String(e?.message || e); }
+  }
+  return { ok: false, err: lastErr || 'updateWorldbookWith 各档尝试均失败', changed: [], sample, stats: { total: 0, plot: 0, noCh: 0 } };
+}
+
+/* 【修 v1.35】往返试写也改成自识别：翻哪一条由 update_fn 遍历时自己决定，
+   翻完记下它在 TH 视角里的真实 uid，还原时用同一 uid 在 update_fn 内部
+   定位 —— 前后两次都在 TH 自己的坐标系里，重排影响不到。 */
+async function thProbeRoundTrip(nm) {
+  const t = thGet();
+  if (!t || typeof t.updateWorldbookWith !== 'function') return { ok: false, err: 'updateWorldbookWith 不可用', sample: [] };
+  const sample = [];
+  const run = async (mk) => {
+    let last = '';
+    for (const tr of [{ a: 3, render: 'immediate' }, { a: 3, render: 'debounced' }, { a: 2, render: null }]) {
+      try {
+        if (tr.a === 3) await t.updateWorldbookWith(nm, mk(), { render: tr.render });
+        else await t.updateWorldbookWith(nm, mk());
+        return { ok: true, err: '' };
+      } catch (e) { last = String(e?.message || e); /* 换下一档 */ }
+    }
+    /* 异常原因必须带出去：只报"各档尝试均失败"等于把真实原因吞掉，
+       用户拿着这句什么都排查不了。 */
+    return { ok: false, err: 'updateWorldbookWith 各档尝试均失败' + (last ? '：' + last : '') };
+  };
+  let seen = null;
+  const r1 = await run(() => function (entry) {
+    if (entry == null) return entry;
+    fnSamplePush(sample, entry);
+    if (seen) return entry;
+    if (!isPlotEntry(entry) || isCriticalEntry(entry)) return entry;
+    const ec = entryChapter(entry);
+    if (ec == null) return entry;
+    const cur = entryIsEnabled(entry);
+    if (cur === null) return entry;              // 状态未知的不拿来试
+    const want = !cur;
+    seen = { uid: entry.uid, ch: ec, prev: cur, want, name: entryName(entry) };
+    const out = Object.assign({}, entry, { enabled: want });
+    try { out.disable = !want; } catch (_) {}
+    return out;
+  });
+  if (!r1.ok) return { ok: false, err: r1.err, sample };
+  if (!seen) {
+    return {
+      ok: false, sample,
+      err: sample.length
+        ? `update_fn 收到了 ${sample.length}+ 条，但没有一条是可安全试写的剧情条目（首条 uid=${sample[0] && sample[0].uid}，head=「${sample[0] && sample[0].head}」）`
+        : 'update_fn 未被调用（TH 没有把任何条目递给我们）',
+    };
+  }
+  const readBack = async (expect) => {
+    for (let i = 0; i < 6; i++) {
+      let v = null;
+      try {
+        const any = await wbReadAny(nm);
+        const list = (any && any.entries) || [];
+        let hit = null;
+        if (seen.uid != null) hit = list.find(x => x && x.uid != null && String(x.uid) === String(seen.uid));
+        if (!hit && seen.ch != null) hit = list.find(x => isPlotEntry(x) && entryChapter(x) === seen.ch);
+        v = hit ? entryIsEnabled(hit) : null;
+      } catch (_) { v = null; }
+      if (v === expect) return v;
+      if (i < 5) await new Promise(r => setTimeout(r, 120));
+    }
+    return null;
+  };
+  const flipped = await readBack(seen.want);
+  const r2 = await run(() => function (entry) {
+    if (entry == null) return entry;
+    if (!isPlotEntry(entry)) return entry;
+    const ec = entryChapter(entry);
+    if (ec == null) return entry;
+    const same = (seen.uid != null && entry.uid != null && String(entry.uid) === String(seen.uid))
+      || (seen.uid == null && seen.ch != null && ec === seen.ch);
+    if (!same) return entry;
+    const out = Object.assign({}, entry, { enabled: !!seen.prev });
+    try { out.disable = !seen.prev; } catch (_) {}
+    return out;
+  });
+  const restored = await readBack(!!seen.prev);
+  const ok = r2.ok && flipped === seen.want && restored === !!seen.prev;
+  const tag = `uid=${seen.uid}${seen.ch != null ? `（第${seen.ch}章）` : ''}`;
+  /* 失败原因分开说：读不回来（没落盘）和还原不回去（留下副作用）
+     是两回事，混成一句会直接把排查方向带偏。 */
+  const why = [];
+  if (flipped !== seen.want) why.push(`写入未生效（uid=${seen.uid} 改后仍为 ${flipped}，期望 ${seen.want}）`);
+  if (restored !== !!seen.prev) why.push(`往返还原失败（uid=${seen.uid} 现在为 ${restored}，应为 ${!!seen.prev}）`);
+  if (!r2.ok) why.push(`还原写入失败：${r2.err}`);
+  return {
+    ok, sample, seen,
+    err: ok ? '' : `试写 ${tag}：` + (why.join('；') || '原因未知'),
+    via: `TavernHelper.updateWorldbookWith（往返实测：翻转↔还原均落盘；试写条目 ${tag}）`,
+  };
 }
 
 /* 读一次世界书并【实际试写】探测写入能力，结果缓存 30 秒 */
@@ -2788,6 +2901,7 @@ async function wbProbe(force, opt) {
   try {
     const nm = wbCurrentName() || out.name;
     const rt = await wbProbeWriteRoundTrip(nm, entries);
+    out.fnSample = rt.sample || [];
     if (rt.ok) { out.writeOk = true; out.writeVia = rt.via; }
     else { out.writeOk = false; out.writeErr = rt.err || '试写失败'; }
   } catch (e) { out.writeOk = false; out.writeErr = String(e?.message || e); }
@@ -2852,30 +2966,25 @@ async function wbApplyChapter(ch, range) {
      旧代码 TH 通道写了却没接进这里，等于白写。 */
   let apiOk = false, src = ''; const tried = [];
   const nm = wbCurrentName() || p.name;
-  const wantMap = {};
-  const nameMap = {};
-  /* 【修 v1.34】主通道改用 targets（多键匹配）：
-     携带 uid + name + comment + 章号，任一键命中即认定同一条目。
-     uid 在导入后必被重排，只按 uid 匹配会一条都改不动。 */
-  const targets = [];
-  for (const it of changed) {
-    wantMap[String(it.uid)] = it.enable;
-    const k = String(it.name || '').trim();
-    if (k) nameMap[k] = it.enable;
-    targets.push({
-      uid: it.uid,
-      name: String(it.name || ''),
-      comment: String(it.e?.comment || ''),
-      ch: it.ch,
-      on: it.enable,
-    });
-  }
+  /* 【修 v1.35】不再构造 wantMap / nameMap / targets。
+     那套"拿本地算出的 uid/name 去书里找同一条"的做法，在 uid 被重排后
+     必然落空（matched=0 且接口不报错，最难查的一类假失败）。
+     判定已全部下沉到 update_fn，本地不需要再做任何对齐。 */
   if (nm && thHas('updateWorldbookWith')) {
-    /* 只传 targets：wantMap/nameMap 同时传会造成「A 的 uid + B 的名字」
-       这类跨条目串匹配，多条改动时极易误伤。 */
-    const r = await thWrite(nm, null, { targets });
-    if (r.ok) { apiOk = true; src = r.via || 'TavernHelper.updateWorldbookWith'; }
-    else tried.push('TH:' + r.err);
+    /* 【修 v1.35】主通道：规则式局部更新。判定全部下沉到 update_fn 内部，
+       用 TH 递来的对象自判，不需要"我们手里的条目"与"书里的条目"对齐。 */
+    const r = await thApplyByRule(nm, { range: { lo, hi } });
+    if (r.ok) {
+      apiOk = true;
+      src = r.via || 'TavernHelper.updateWorldbookWith';
+      touched = r.stats.plot; skipped = r.stats.noCh;
+      if (r.changed.length) {
+        changed.length = 0;
+        for (const c of r.changed) changed.push({ uid: c.uid, ch: c.ch, enable: c.enabled, e: null, name: c.name });
+      } else if (changed.length) {
+        src += `（TH 视角无改动，本地扫描认为要改 ${changed.length} 条：两边读到的不是同一批数据，以 TH 为准）`;
+      }
+    } else tried.push('TH:' + r.err);
   } else if (!nm) tried.push('拿不到世界书名，TH 写入跳过');
   else tried.push('TH:updateWorldbookWith 不可用');
   if (!apiOk) {
@@ -5631,6 +5740,11 @@ function bindPane(host) {
         ? `字段体检：共 ${ct.total} 条，含 enabled ${ct.hasEnabled} 条、含 disable ${ct.hasDisable} 条、两者都有 ${ct.both} 条${ct.conflict ? `、语义冲突 ${ct.conflict} 条` : ''}`
         : '';
 
+      const fnSmp = (p.fnSample || []).map((s, i) =>
+        `  ${i + 1}. uid=${s.uid}(${s.uidType}) name=${s.hasName ? '有' : '无'} comment=${s.hasComment ? '有' : '无'} enabled=${s.enabled} 「${s.head}」`).join('\n');
+      const fnInfo = (p.fnSample || []).length
+        ? `update_fn 实际收到的条目（前 3 条）：\n${fnSmp}`
+        : '';
       out.textContent = `世界书检测成功\n`
         + `来源：${p.src}\n`
         + `世界书名：${p.name || wbCurrentName() || '（空）'}${p.nameSrc ? '　[' + p.nameSrc + ']' : ''}\n`
@@ -5639,6 +5753,7 @@ function bindPane(host) {
         + contract + `\n\n`
         + (ctInfo ? ctInfo + `\n\n` : '')
         + thInfo + `\n\n`
+        + (fnInfo ? fnInfo + `\n\n` : '')
         + `写入能力：${p.writeOk ? '✅ 实测可写（' + p.writeVia + '）' : '❌ ' + (p.writeErr || '试写失败')}\n\n`
         + slashInfo
         + (warn.length ? `\n\n⚠ 发现问题：\n` + warn.map(w => '  · ' + w).join('\n') : '\n\n✅ 数据结构契约对齐，未发现问题');
