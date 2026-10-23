@@ -2252,7 +2252,7 @@ async function wbProbeWriteRoundTrip(name, entries) {
     /* 【修 v1.35】往返试写改成自识别：翻哪一条由 update_fn 自己挑，
        不再拿我们列表里的 uid 去书里找 —— 重排后根本找不到。 */
     const rt = await thProbeRoundTrip(nm);
-    if (rt.ok) return { ok: true, via: rt.via, sample: rt.sample };
+    if (rt.ok) return { ok: true, via: rt.via, sample: rt.sample, shape: rt.shape };
     /* TH 走不通：再试一次全量写回，两路都失败才判 ❌ */
     try {
       await wbWriteBack(nm, list);
@@ -2685,6 +2685,145 @@ function fnSamplePush(list, entry) {
   });
 }
 
+/* ==========================================================================
+   【修 v1.36】update_fn 的入参形状是未知的，不能再靠猜。
+
+   实测证据（用户环境）：update_fn 收到的对象 uid=undefined、无 name、
+   无 comment、无 content —— 它压根不是一个 WorldbookEntry。之前所有
+   "改匹配键"的尝试都是在错误前提下打补丁，注定无效。
+
+   TH 至少存在两种实现：
+     A. 逐条调用  fn(entry)        —— entry 就是 WorldbookEntry
+     B. 一次性调用 fn(entries)     —— entries 是数组，或 {[uid]:entry} 字典，
+                                     或 {entries:[...]} / {data:{entries:[...]}}
+   B 情形下 uid/name 全落在元素上，顶层取值自然是 undefined，与实测完全吻合。
+
+   对策：把"处理单条"的函数适配成能应对任意形状。形状认不出来就原样返回，
+   绝不动数据。
+   ========================================================================== */
+
+/* 入参形状体检：这是排查写入失败的第一手材料，以前完全看不见 */
+function dumpArgShape(arg) {
+  const d = { type: arg === null ? 'null' : typeof arg, isArray: Array.isArray(arg), ctor: '', keys: [], elemKeys: [], preview: '' };
+  try {
+    if (arg && typeof arg === 'object') {
+      d.ctor = String((arg.constructor && arg.constructor.name) || '');
+      d.keys = Object.keys(arg).slice(0, 12);
+    }
+  } catch (_) { /* 忽略 */ }
+  try { d.preview = String(JSON.stringify(arg) || '').slice(0, 240); } catch (_) { d.preview = '(无法序列化)'; }
+  try {
+    const first = Array.isArray(arg) ? arg[0]
+      : (arg && typeof arg === 'object' ? arg[Object.keys(arg)[0]] : null);
+    if (first && typeof first === 'object') d.elemKeys = Object.keys(first).slice(0, 12);
+  } catch (_) { /* 忽略 */ }
+  return d;
+}
+
+/* 这个对象像不像一个条目？
+   注意：世界书容器也带 name（书名！），只凭 name 判断会把它当成条目，
+   于是整本书被当成"一条不用改的条目"原样返回 —— 改动全部落空。
+   所以 name 必须与 content/comment 等条目专属字段同时出现才算条目。 */
+function looksLikeEntry(o) {
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
+  if (o.uid != null) return true;
+  if (o.key != null || o.entryName != null) return true;
+  if (typeof o.enabled === 'boolean' || typeof o.disable === 'boolean') return true;
+  if (o.comment != null && o.comment !== '') return true;
+  return !!(o.name && o.content !== undefined);
+}
+
+/* 把"处理单条"的函数适配成任意形状，并保持返回值的形状与入参一致 */
+function adaptEntryFn(fnEntry, onShape) {
+  const self = function (arg) {
+    if (arg == null) return arg;
+    if (onShape && !onShape.got) onShape.got = dumpArgShape(arg);
+    /* B-1：{entries:[...]} / {data:{entries:[...]}} 这类容器 —— 必须先判，
+       因为容器自己也带 name（世界书名），先判单条会把它误当成条目。 */
+    if (!Array.isArray(arg) && typeof arg === 'object') {
+      const paths = [['entries'], ['data', 'entries'], ['world_info', 'entries'], ['data', 'data', 'entries']];
+      for (const p of paths) {
+        let cur = arg, ok = true;
+        for (const k of p) { if (cur && typeof cur === 'object' && cur[k] != null) cur = cur[k]; else { ok = false; break; } }
+        if (!ok || cur == null || typeof cur !== 'object') continue;
+        const inner = adaptEntryFn(fnEntry, null)(cur);
+        if (inner === cur) return arg;
+        const out = Object.assign({}, arg);
+        let tgt = out;
+        for (let i = 0; i < p.length - 1; i++) { tgt[p[i]] = Object.assign({}, tgt[p[i]]); tgt = tgt[p[i]]; }
+        tgt[p[p.length - 1]] = inner;
+        return out;
+      }
+    }
+    /* A：单条（放在容器判断之后：容器也带 name，先判单条会误吞） */
+    if (looksLikeEntry(arg)) return fnEntry(arg);
+    /* B-2：数组 */
+    if (Array.isArray(arg)) {
+      let touched = false;
+      const arr = arg.map(x => {
+        if (!looksLikeEntry(x)) return x;
+        const r = fnEntry(x);
+        if (r !== x) touched = true;
+        return r;
+      });
+      return touched ? arr : arg;
+    }
+    /* B-3：{[uid]: entry} 字典 */
+    if (typeof arg === 'object') {
+      const ks = Object.keys(arg);
+      if (!ks.length) return arg;
+      if (!ks.slice(0, 5).every(k => looksLikeEntry(arg[k]))) return arg;
+      let touched = false; const out = {};
+      for (const k of ks) {
+        const v = arg[k];
+        if (!looksLikeEntry(v)) { out[k] = v; continue; }
+        const r = fnEntry(v);
+        if (r !== v) touched = true;
+        out[k] = r;
+      }
+      return touched ? out : arg;
+    }
+    return arg;
+  };
+  return self;
+}
+
+/* 兜底：updateWorldbookWith 用不了时，走 getWorldbook 读全量 → 改 → replaceWorldbook 写回。
+   读的那条路是实测可用的（893 条），所以这份数据是完整可信的。
+   全量覆盖有误伤风险，故只在主路径确实失效时才启用，且改动条目数会在面板上如实显示。 */
+async function thReplaceWrite(nm, rule) {
+  const t = thGet();
+  if (!t || typeof t.replaceWorldbook !== 'function') return { ok: false, err: 'replaceWorldbook 不可用', changed: [] };
+  let list = null;
+  try { list = await t.getWorldbook(nm); } catch (e) { return { ok: false, err: 'getWorldbook 失败：' + String(e?.message || e), changed: [] }; }
+  if (!Array.isArray(list) || !list.length) return { ok: false, err: 'getWorldbook 返回空', changed: [] };
+  const changed = [];
+  const out = list.map(e => {
+    if (!e || !isPlotEntry(e)) return e;
+    const ec = entryChapter(e);
+    if (ec == null) return e;
+    const wantOn = rule && rule.range ? (ec >= rule.range.lo && ec <= rule.range.hi)
+      : (rule && typeof rule.want === 'function' ? !!rule.want(ec) : null);
+    if (wantOn === null) return e;
+    const cur = entryIsEnabled(e);
+    if (cur !== null && cur === wantOn) return e;
+    changed.push({ uid: e.uid, ch: ec, enabled: wantOn, prev: cur, name: entryName(e) });
+    const o = Object.assign({}, e, { enabled: wantOn });
+    try { o.disable = !wantOn; } catch (_) { /* 冻结对象则跳过 */ }
+    return o;
+  });
+  if (!changed.length) return { ok: true, changed: [], via: 'TavernHelper.replaceWorldbook（无需改动）' };
+  let last = '';
+  for (const ro of ['immediate', 'debounced', null]) {
+    try {
+      if (ro) await t.replaceWorldbook(nm, out, { render: ro });
+      else await t.replaceWorldbook(nm, out);
+      return { ok: true, changed, via: `TavernHelper.replaceWorldbook（render=${ro || '默认'}）` };
+    } catch (e) { last = String(e?.message || e); }
+  }
+  return { ok: false, err: 'replaceWorldbook 各档失败：' + last, changed: [] };
+}
+
 /* 按规则批量启停。rule: {range:{lo,hi}} 或 {want:(ch)=>bool}
    返回 {ok, changed:[{uid,ch,enabled,prev,name}], sample, stats, via, err} */
 async function thApplyByRule(nm, rule) {
@@ -2692,7 +2831,10 @@ async function thApplyByRule(nm, rule) {
   const empty = { ok: false, err: 'updateWorldbookWith 不可用', changed: [], sample: [], stats: { total: 0, plot: 0, noCh: 0 } };
   if (!t || typeof t.updateWorldbookWith !== 'function') return empty;
   const sample = [];
-  const mkFn = (acc, stats) => function (entry) {
+  const shape = { got: null };
+  /* 【修 v1.36】包一层自适应：无论 TH 递来的是单条、数组还是字典，
+     都能逐元素处理；顺带把入参形状记下来，面板上如实显示。 */
+  const mkFn = (acc, stats) => adaptEntryFn(function (entry) {
     if (entry == null) return entry;
     stats.total++;
     fnSamplePush(sample, entry);
@@ -2710,7 +2852,7 @@ async function thApplyByRule(nm, rule) {
     const out = Object.assign({}, entry, { enabled: wantOn });
     try { out.disable = !wantOn; } catch (_) { /* 冻结对象则跳过 */ }
     return out;
-  };
+  }, shape);
   const tries = [
     { a: 3, render: 'immediate', tag: 'TavernHelper.updateWorldbookWith' },
     { a: 3, render: 'debounced', tag: 'TavernHelper.updateWorldbookWith(render=debounced)' },
@@ -2726,10 +2868,28 @@ async function thApplyByRule(nm, rule) {
          这比"匹配不上"更根本 —— 世界书名不对、或该 TH 版本实现不同，
          都必须如实报出来，不能当成"无需改动"蒙混过关。 */
       if (!stats.total) { lastErr = 'update_fn 未被调用（TH 没有把任何条目递给我们）'; break; }
-      return { ok: true, changed: acc, sample, stats, via: tr.tag };
+      /* 收到了条目却一条都认不出是剧情条目：说明入参形状与预期不同。
+         这种情况下继续重试没有意义，直接转全量替换兜底。 */
+      if (!stats.plot) {
+        const s = shape.got;
+        lastErr = `update_fn 收到 ${stats.total} 条但无一可识别为剧情条目（入参：${s ? s.type + (s.isArray ? '/数组' : '') + '，顶层字段[' + s.keys.join(',') + ']，元素字段[' + s.elemKeys.join(',') + ']' : '未知'}）`;
+        break;
+      }
+      return { ok: true, changed: acc, sample, stats, via: tr.tag, shape: shape.got };
     } catch (e) { lastErr = String(e?.message || e); }
   }
-  return { ok: false, err: lastErr || 'updateWorldbookWith 各档尝试均失败', changed: [], sample, stats: { total: 0, plot: 0, noCh: 0 } };
+  /* 【修 v1.36】主路径失效 → 全量替换兜底。
+     getWorldbook 这条路是实测可用的（893 条），拿它读全量、改完写回，
+     绕开 updateWorldbookWith 的形状问题。 */
+  const fb = await thReplaceWrite(nm, rule);
+  if (fb.ok) {
+    return { ok: true, changed: fb.changed, sample, stats: { total: 0, plot: 0, noCh: 0 }, via: fb.via, shape: shape.got, viaFallback: true };
+  }
+  return {
+    ok: false, sample, shape: shape.got,
+    err: lastErr + (fb.err ? '；全量替换兜底也未成功：' + fb.err : ''),
+    changed: [], stats: { total: 0, plot: 0, noCh: 0 },
+  };
 }
 
 /* 【修 v1.35】往返试写也改成自识别：翻哪一条由 update_fn 遍历时自己决定，
@@ -2739,12 +2899,15 @@ async function thProbeRoundTrip(nm) {
   const t = thGet();
   if (!t || typeof t.updateWorldbookWith !== 'function') return { ok: false, err: 'updateWorldbookWith 不可用', sample: [] };
   const sample = [];
+  const shape = { got: null };
   const run = async (mk) => {
     let last = '';
     for (const tr of [{ a: 3, render: 'immediate' }, { a: 3, render: 'debounced' }, { a: 2, render: null }]) {
       try {
-        if (tr.a === 3) await t.updateWorldbookWith(nm, mk(), { render: tr.render });
-        else await t.updateWorldbookWith(nm, mk());
+        /* 【修 v1.36】同样包自适应层 */
+        const fn = adaptEntryFn(mk(), shape);
+        if (tr.a === 3) await t.updateWorldbookWith(nm, fn, { render: tr.render });
+        else await t.updateWorldbookWith(nm, fn);
         return { ok: true, err: '' };
       } catch (e) { last = String(e?.message || e); /* 换下一档 */ }
     }
@@ -2768,13 +2931,22 @@ async function thProbeRoundTrip(nm) {
     try { out.disable = !want; } catch (_) {}
     return out;
   });
-  if (!r1.ok) return { ok: false, err: r1.err, sample };
+  const shapeStr = shape.got
+    ? `${shape.got.type}${shape.got.isArray ? '/数组' : ''}，顶层字段[${shape.got.keys.join(',')}]，元素字段[${shape.got.elemKeys.join(',')}]`
+    : '未知';
+  if (!r1.ok) return { ok: false, err: r1.err, sample, shape: shape.got };
   if (!seen) {
+    /* 【修 v1.36】主路径认不出形状 → 改用全量替换做一次真实往返，
+       能写通就说明这条路可用，不必卡在 updateWorldbookWith 上。 */
+    const rp = await thProbeReplace(nm);
+    if (rp.ok) return { ok: true, sample, shape: shape.got, via: rp.via, seen: rp.seen };
     return {
-      ok: false, sample,
-      err: sample.length
+      ok: false, sample, shape: shape.got,
+      err: (sample.length
         ? `update_fn 收到了 ${sample.length}+ 条，但没有一条是可安全试写的剧情条目（首条 uid=${sample[0] && sample[0].uid}，head=「${sample[0] && sample[0].head}」）`
-        : 'update_fn 未被调用（TH 没有把任何条目递给我们）',
+        : 'update_fn 未被调用（TH 没有把任何条目递给我们）')
+        + `；入参形状：${shapeStr}`
+        + (rp.err ? '；全量替换兜底也未成功：' + rp.err : ''),
     };
   }
   const readBack = async (expect) => {
@@ -2820,6 +2992,60 @@ async function thProbeRoundTrip(nm) {
     err: ok ? '' : `试写 ${tag}：` + (why.join('；') || '原因未知'),
     via: `TavernHelper.updateWorldbookWith（往返实测：翻转↔还原均落盘；试写条目 ${tag}）`,
   };
+}
+
+/* 【修 v1.36】全量替换版往返试写：读全量 → 翻一条 → 写回 → 读回 → 还原。
+   只挑剧情条目且避开要害条目；任一环节异常都如实报出原因。 */
+async function thProbeReplace(nm) {
+  const t = thGet();
+  if (!t || typeof t.replaceWorldbook !== 'function') return { ok: false, err: 'replaceWorldbook 不可用' };
+  let list = null;
+  try { list = await t.getWorldbook(nm); } catch (e) { return { ok: false, err: 'getWorldbook 失败：' + String(e?.message || e) }; }
+  if (!Array.isArray(list) || !list.length) return { ok: false, err: 'getWorldbook 返回空' };
+  const pick = list.find(e => e && isPlotEntry(e) && !isCriticalEntry(e) && entryChapter(e) != null && entryIsEnabled(e) !== null);
+  if (!pick) return { ok: false, err: '世界书里没有可安全试写的剧情条目' };
+  const ch = entryChapter(pick), prev = !!entryIsEnabled(pick), want = !prev;
+  const seen = { uid: pick.uid, ch, prev, want, name: entryName(pick) };
+  const write = async (on) => {
+    const out = list.map(e => {
+      const same = (pick.uid != null && e && String(e.uid) === String(pick.uid)) || (pick.uid == null && e && isPlotEntry(e) && entryChapter(e) === ch);
+      if (!same) return e;
+      const o = Object.assign({}, e, { enabled: !!on });
+      try { o.disable = !on; } catch (_) { /* 忽略 */ }
+      return o;
+    });
+    let last = '';
+    for (const ro of ['immediate', 'debounced', null]) {
+      try {
+        if (ro) await t.replaceWorldbook(nm, out, { render: ro });
+        else await t.replaceWorldbook(nm, out);
+        return { ok: true };
+      } catch (e) { last = String(e?.message || e); }
+    }
+    return { ok: false, err: last || 'replaceWorldbook 失败' };
+  };
+  const readState = async () => {
+    for (let i = 0; i < 6; i++) {
+      try {
+        const any = await wbReadAny(nm);
+        const arr = (any && any.entries) || [];
+        const hit = arr.find(x => x && isPlotEntry(x) && entryChapter(x) === ch);
+        if (hit) return entryIsEnabled(hit);
+      } catch (_) { /* 继续重试 */ }
+      await new Promise(r => setTimeout(r, 120));
+    }
+    return null;
+  };
+  const w1 = await write(want);
+  if (!w1.ok) return { ok: false, err: '试写失败：' + w1.err, seen };
+  const flipped = await readState();
+  const w2 = await write(prev);
+  if (!w2.ok) return { ok: false, err: '试写后无法还原：' + w2.err, seen };
+  const restored = await readState();
+  if (flipped !== want || restored !== prev) {
+    return { ok: false, err: `写入未生效（翻后=${flipped} 期望=${want}；还原后=${restored} 期望=${prev}）`, seen };
+  }
+  return { ok: true, seen, via: `TavernHelper.replaceWorldbook（往返实测：翻转↔还原均落盘；试写条目 uid=${pick.uid}（第${ch}章））` };
 }
 
 /* 读一次世界书并【实际试写】探测写入能力，结果缓存 30 秒 */
@@ -2902,6 +3128,7 @@ async function wbProbe(force, opt) {
     const nm = wbCurrentName() || out.name;
     const rt = await wbProbeWriteRoundTrip(nm, entries);
     out.fnSample = rt.sample || [];
+    out.fnShape = rt.shape || null;
     if (rt.ok) { out.writeOk = true; out.writeVia = rt.via; }
     else { out.writeOk = false; out.writeErr = rt.err || '试写失败'; }
   } catch (e) { out.writeOk = false; out.writeErr = String(e?.message || e); }
@@ -5745,6 +5972,16 @@ function bindPane(host) {
       const fnInfo = (p.fnSample || []).length
         ? `update_fn 实际收到的条目（前 3 条）：\n${fnSmp}`
         : '';
+      /* 【修 v1.36】入参形状是关键证据：顶层/元素各有哪些字段，一眼看出
+         TH 递过来的究竟是单条、数组还是字典。 */
+      const shp = p.fnShape;
+      const shapeInfo = shp
+        ? `update_fn 入参形状：${shp.type}${shp.isArray ? '（数组）' : ''}`
+          + `${shp.ctor ? ' ctor=' + shp.ctor : ''}\n`
+          + `  顶层字段：[${(shp.keys || []).join(', ')}]\n`
+          + `  元素字段：[${(shp.elemKeys || []).join(', ')}]\n`
+          + `  原样预览：${shp.preview}`
+        : '';
       out.textContent = `世界书检测成功\n`
         + `来源：${p.src}\n`
         + `世界书名：${p.name || wbCurrentName() || '（空）'}${p.nameSrc ? '　[' + p.nameSrc + ']' : ''}\n`
@@ -5754,6 +5991,7 @@ function bindPane(host) {
         + (ctInfo ? ctInfo + `\n\n` : '')
         + thInfo + `\n\n`
         + (fnInfo ? fnInfo + `\n\n` : '')
+        + (shapeInfo ? shapeInfo + `\n\n` : '')
         + `写入能力：${p.writeOk ? '✅ 实测可写（' + p.writeVia + '）' : '❌ ' + (p.writeErr || '试写失败')}\n\n`
         + slashInfo
         + (warn.length ? `\n\n⚠ 发现问题：\n` + warn.map(w => '  · ' + w).join('\n') : '\n\n✅ 数据结构契约对齐，未发现问题');
