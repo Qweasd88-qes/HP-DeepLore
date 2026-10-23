@@ -771,6 +771,9 @@
 .hp-alias-cell .hp-inp{flex:1 1 100%;margin-top:4px;min-width:100px}
 .hp-mini.danger{color:#e06c75;border-color:rgba(224,108,117,.4)}
 .hp-mini.danger:hover{background:rgba(224,108,117,.14)}
+/* v1.38 恢复默认：二次确认武装态 */
+.hp-mini.armed{background:rgba(224,108,117,.22)!important;border-color:#e06c75!important;color:#ffb3b8!important;font-weight:600}
+.hp-mini.armed:hover{background:rgba(224,108,117,.32)!important}
 
 /* ══════════════════════════════════════════════════════
    v1.18 永久记忆：指示灯 + 状态徽标 + 记忆条目

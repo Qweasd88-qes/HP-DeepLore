@@ -310,7 +310,7 @@ function stEventTypes() {
 }
 
 const EXT_ID = 'hp-deeplore';
-const EXT_VER = 'v1.35.0';
+const EXT_VER = 'v1.38.0';
 const EXT_NAME = 'HP DeepLore';
 const DB_NAME = 'hp_deeplore';
 const DB_VER = 2;   /* 【修 v1.28】+1：新增 settings store，用于配置兜底存储 */
@@ -2074,7 +2074,7 @@ let __wbProbe = { at: 0, ok: false, name: '', count: 0, plotCount: 0, writeOk: f
    ST 1.1.9 的世界书条目集合是 { [uid:string]: entry } 字典，不是数组。
    但不同版本/不同挂载点还可能给数组、{entries:...} 等形态，
    插件内部一律统一成「每项都带 uid 的数组」，写回时再还原成字典。 */
-function looksLikeEntry(x) {   /* v1.27 原版：世界书读取归一化专用，勿改名 */
+function looksLikeEntry(x) {
   return !!x && typeof x === 'object' && !Array.isArray(x)
     && ('content' in x || 'comment' in x || 'key' in x || 'disable' in x || 'enabled' in x || 'uid' in x);
 }
@@ -2724,7 +2724,7 @@ function dumpArgShape(arg) {
    注意：世界书容器也带 name（书名！），只凭 name 判断会把它当成条目，
    于是整本书被当成"一条不用改的条目"原样返回 —— 改动全部落空。
    所以 name 必须与 content/comment 等条目专属字段同时出现才算条目。 */
-function argLooksLikeEntry(o) {   /* 【修 v1.37】原名与 v1.27 的 looksLikeEntry 撞车，覆盖了读取归一化用的原版 */
+function argLooksLikeEntry(o) {
   if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
   if (o.uid != null) return true;
   if (o.key != null || o.entryName != null) return true;
@@ -3297,6 +3297,97 @@ function entryName(e) {
   if (!e) return '';
   /* 压平换行：条目名会拼进斜杠命令，带换行会把命令截断 */
   return String(e.comment || e.name || e.entryName || e.key || '').replace(/[\r\n]+/g, ' ').trim();
+}
+
+/* 【v1.38】剧情条目状态快照。
+   只统计"剧情条目"，非剧情条目完全不进统计 —— 这样"恢复默认"前后
+   能拿同一份口径对比，一眼看出有没有误伤别类条目。 */
+async function wbPlotState(nm) {
+  let entries = [];
+  try {
+    const any = await wbReadAny(nm || wbCurrentName());
+    if (any && any.entries && any.entries.length) entries = any.entries;
+  } catch (e) { /* 忽略，走下面的兜底 */ }
+  if (!entries.length) {
+    const live = wbReadLive();
+    if (live) entries = live.entries;
+  }
+  const on = [], off = [], noCh = [];
+  let plot = 0, other = 0;
+  for (const e of entries) {
+    if (!e || !isPlotEntry(e)) { other++; continue; }
+    plot++;
+    const ec = entryChapter(e);
+    if (ec == null) { noCh.push(entryName(e).slice(0, 24)); continue; }
+    (entryIsEnabled(e) === false ? off : on).push(ec);
+  }
+  on.sort((a, b) => a - b); off.sort((a, b) => a - b);
+  return { total: entries.length, plot, other, on, off, noCh };
+}
+
+/* 章号数组压成区间串，例如 [1,2,3,7] → "1-3、7" */
+function chRanges(list) {
+  const a = (list || []).slice().sort((x, y) => x - y);
+  if (!a.length) return '无';
+  const seg = []; let s = a[0], p = a[0];
+  for (let i = 1; i < a.length; i++) {
+    if (a[i] === p + 1) { p = a[i]; continue; }
+    seg.push(s === p ? `${s}` : `${s}-${p}`); s = p = a[i];
+  }
+  seg.push(s === p ? `${s}` : `${s}-${p}`);
+  return seg.join('、');
+}
+
+/* 【v1.38】恢复默认剧情条目：把所有剧情条目一律禁用。
+   开新一轮前点它，清掉上一轮残留的启用状态，避免剧情错乱。
+   硬性约束：只看 isPlotEntry，非剧情条目（变量列表 / mvu_update / initvar
+   之类）一条都不碰 —— 它们的 enabled 原样返回。 */
+async function wbResetPlot() {
+  const p = await wbProbe(true, { noWrite: true });
+  if (!p.ok) return { ok: false, changed: 0, err: p.err || '读不到世界书' };
+  const nm = wbCurrentName() || p.name;
+  if (!nm) return { ok: false, changed: 0, err: '拿不到世界书名，无法操作' };
+
+  const before = await wbPlotState(nm);
+  let changed = [], src = '', tried = [];
+
+  /* 主通道：TH 局部更新。判定下沉到 update_fn，非剧情条目原样返回。 */
+  if (thHas('updateWorldbookWith')) {
+    const r = await thApplyByRule(nm, { want: () => false });
+    if (r.ok) { changed = r.changed || []; src = r.via || 'TavernHelper.updateWorldbookWith'; }
+    else tried.push('TH:' + r.err);
+  } else tried.push('TH:updateWorldbookWith 不可用');
+
+  /* 兜底：全量写回（entries 规范化成 {[uid]:entry}） */
+  if (!src) {
+    try {
+      const got = await wbReadAny(nm);
+      if (got && got.entries && got.entries.length) {
+        const es = got.entries;
+        let n = 0;
+        for (const e of es) {
+          if (!e || !isPlotEntry(e)) continue;
+          if (entryChapter(e) == null) continue;
+          if (entryIsEnabled(e) === false && !entryNeedFix(e, false)) continue;
+          setEntryEnabled(e, false);
+          n++; changed.push({ uid: e.uid, ch: entryChapter(e), enabled: false, name: entryName(e) });
+        }
+        await wbWriteBack(nm, es);
+        src = 'api:/worldinfo/edit';
+      } else tried.push('读不到条目，API 写入跳过');
+    } catch (e) { tried.push('API:' + String(e?.message || e)); }
+  }
+
+  try { const ps = await wbPersist(); if (ps.saved) src += ' + saveWorldInfo(' + ps.via + ')'; } catch (e) { /* 忽略 */ }
+
+  const after = await wbPlotState(nm);
+  if (!src) {
+    return {
+      ok: false, changed: 0, before, after,
+      err: '恢复默认失败（试过：' + (tried.join('；') || '无可用路径') + '）',
+    };
+  }
+  return { ok: true, changed: changed.length, before, after, src, list: changed };
 }
 /* 用 Slash 命令启停单条。多格式尝试，逐个试跑 */
 async function wbSlashSetEntry(name, enable) {
@@ -4873,9 +4964,18 @@ function plotPaneHTML() {
       <button class="hp-mini p" id="hp-plot-run">现在定位一次</button>
       <button class="hp-mini" id="hp-plot-dry">只看不改（试算）</button>
       <button class="hp-mini" id="hp-plot-wb">检测世界书</button>
-      <button class="hp-mini" id="hp-plot-off">全部禁用</button>
+      <button class="hp-mini" id="hp-plot-state">查启用状态</button>
     </div>
-    <pre id="hp-plot-out" style="margin-top:12px;background:var(--hp-card);border:1px solid var(--hp-bd);border-radius:8px;padding:12px;font-size:11.5px;color:var(--hp-tx2);max-height:320px;overflow:auto;white-space:pre-wrap">${last}\n${wb}</pre>`;
+    <div class="hp-row" style="margin-top:8px">
+      <button class="hp-mini danger" id="hp-plot-off">恢复默认剧情条目（全部关闭）</button>
+      <button class="hp-mini" id="hp-plot-copy">复制诊断信息</button>
+    </div>
+    <div class="hp-hint" style="margin-top:6px">
+      恢复默认＝把<b>所有剧情条目</b>一律禁用，开新一轮前点它，清掉上一轮残留的启用状态。<br>
+      <b>只动剧情条目</b>，变量列表 / mvu_update / initvar 等其他条目一条不碰。需要再点一次确认，防误触。
+    </div>
+    <div id="hp-plot-last" style="margin-top:10px;font-size:12px">${last}</div>
+    <pre id="hp-plot-out" style="margin-top:12px;background:var(--hp-card);border:1px solid var(--hp-bd);border-radius:8px;padding:12px;font-size:11.5px;color:var(--hp-tx2);max-height:320px;overflow:auto;white-space:pre-wrap">${wb}</pre>`;
 }
 
 function memPaneHTML() {
@@ -5169,12 +5269,29 @@ async function initUI() {
     n.onclick = () => {
       host.querySelectorAll('.hp-nv').forEach(x => x.classList.remove('on'));
       n.classList.add('on');
-      host.querySelector('#hp-pane-host').innerHTML = paneHTML(Number(n.dataset.p));
+      safeRenderPane(host, Number(n.dataset.p));
       bindPane(host);
     };
   });
-  host.querySelector('#hp-pane-host').innerHTML = paneHTML(0);
+  safeRenderPane(host, 0);
   bindPane(host);
+}
+
+/* 【修 v1.37】单个面板渲染抛异常时，旧写法会让整块内容区永远空白且错误被吞掉。
+   现在只让这一页显示错误原文，其余面板照常可切换。 */
+function safeRenderPane(host, idx) {
+  const ph = host && host.querySelector ? host.querySelector('#hp-pane-host') : null;
+  if (!ph) return;
+  let html = '';
+  try { html = paneHTML(idx); }
+  catch (e) {
+    const nm = (typeof PANES !== 'undefined' && PANES[idx]) || ('第 ' + (idx + 1) + ' 页');
+    html = `<div style="padding:16px"><h3>${esc(nm)}</h3>`
+      + `<div style="color:#e06c75;font-size:13px;margin-top:8px">该面板渲染失败：${esc(String((e && e.message) || e))}</div>`
+      + `<div style="color:var(--hp-tx3);font-size:12px;margin-top:8px">其余面板不受影响，可正常切换。把这段红字发给开发者即可定位。</div></div>`;
+    try { console.error('[HP-DeepLore] 面板渲染失败 idx=' + idx, e); } catch (_) { /* 忽略 */ }
+  }
+  ph.innerHTML = html;
 }
 
 /* 【修 v1.9】连点防护：同一按钮 400ms 内只响应一次 */
@@ -6050,12 +6167,80 @@ function bindPane(host) {
     finally { btn.disabled = false; btn.textContent = '现在定位一次'; }
   });
 
+  /* 【v1.38】查启用状态：只统计剧情条目，顺便确认别的条目没被误伤 */
+  onEv(pane.querySelector('#hp-plot-state'), 'click', async () => {
+    const out = pane.querySelector('#hp-plot-out');
+    const btn = pane.querySelector('#hp-plot-state');
+    btn.disabled = true; const old = btn.textContent; btn.textContent = '读取中…';
+    try {
+      const st = await wbPlotState(wbCurrentName());
+      if (!st.total) { out.textContent = '读不到任何条目。先点「检测世界书」确认通道。'; return; }
+      out.textContent =
+        `世界书共 ${st.total} 条，其中剧情条目 ${st.plot} 条（其他 ${st.other} 条不归本功能管）\n\n`
+        + `启用中：${st.on.length} 条　→ 第 ${chRanges(st.on)} 章\n`
+        + `已禁用：${st.off.length} 条\n`
+        + (st.noCh.length ? `\n⚠ ${st.noCh.length} 条剧情条目解析不出章号：${st.noCh.slice(0, 3).join('、')}${st.noCh.length > 3 ? ' 等' : ''}` : '')
+        + (st.on.length ? `\n\n提示：开新一轮前可以点「恢复默认剧情条目」把它们全部关掉。` : '');
+    } catch (e) { out.textContent = '读取出错：' + String(e?.message || e); }
+    finally { btn.disabled = false; btn.textContent = old; }
+  });
+
+  /* 【v1.38】恢复默认：二次确认 + 前后快照对比 + 非剧情条目零改动保证 */
+  let __plotOffArmed = 0, __plotOffTimer = null;
   onEv(pane.querySelector('#hp-plot-off'), 'click', async () => {
     const out = pane.querySelector('#hp-plot-out');
+    const btn = pane.querySelector('#hp-plot-off');
+    /* 第一段：武装。3 秒内不再点就自动复原，避免手滑一次清掉全部。 */
+    if (Date.now() - __plotOffArmed > 3000) {
+      __plotOffArmed = Date.now();
+      btn.classList.add('armed');
+      btn.textContent = '再点一次确认（3 秒内）';
+      out.textContent = '将关闭全部剧情条目。\n这不会影响变量列表、mvu_update 等其他条目。\n确认就再点一次。';
+      clearTimeout(__plotOffTimer);
+      __plotOffTimer = setTimeout(() => {
+        btn.classList.remove('armed');
+        btn.textContent = '恢复默认剧情条目（全部关闭）';
+      }, 3000);
+      return;
+    }
+    clearTimeout(__plotOffTimer);
+    __plotOffArmed = 0;
+    btn.classList.remove('armed');
+    btn.disabled = true; btn.textContent = '正在恢复…';
     try {
-      const a = await wbApplyChapter(-999, 0);   // 范围不含任何章 → 全部禁用
-      out.textContent = a.ok ? `已全部禁用（改动 ${a.changed} 条）\n写入方式：${a.src}` : `失败：${a.err}`;
-    } catch (e) { out.textContent = '出错：' + e.message; }
+      const a = await wbResetPlot();
+      if (!a.ok) { out.textContent = `恢复默认失败：${a.err}`; return; }
+      const b = a.before || { on: [], off: [], plot: 0, other: 0 };
+      const f = a.after || { on: [], off: [], plot: 0, other: 0 };
+      out.textContent =
+        `✅ 已恢复默认\n\n`
+        + `本次关闭：${a.changed} 条\n`
+        + `改前　剧情条目 ${b.plot} 条，启用 ${b.on.length} 条（第 ${chRanges(b.on)} 章）\n`
+        + `改后　剧情条目 ${f.plot} 条，启用 ${f.on.length} 条${f.on.length ? '（第 ' + chRanges(f.on) + ' 章）' : ''}\n`
+        + `其他条目：${f.other} 条，全程未改动\n`
+        + `写入方式：${a.src}\n\n`
+        + (f.on.length
+          ? `⚠ 仍有 ${f.on.length} 条处于启用状态，可能是没落盘。去世界书面板手动保存一次，或再点一次本按钮。`
+          : '世界书已回到干净状态，可以开新一轮了。');
+      /* 顺手清掉"上次定位"记录，避免面板显示的章号与实际启用状态对不上 */
+      try {
+        settings.plotLastCh = 0; settings.plotLastWhy = ''; settings.plotLastAt = 0;
+        saveSettings();
+        const lastEl = pane.querySelector('#hp-plot-last');
+        if (lastEl) lastEl.textContent = '尚未定位过（已恢复默认）';
+      } catch (e) { /* 忽略 */ }
+    } catch (e) { out.textContent = '出错：' + String(e?.message || e); }
+    finally { btn.disabled = false; btn.textContent = '恢复默认剧情条目（全部关闭）'; }
+  });
+  /* 【v1.38】复制诊断信息：移动端没有控制台，一键把报告取出来 */
+  const copyBtn = pane.querySelector('#hp-plot-copy');
+  if (copyBtn) onEv(copyBtn, 'click', async () => {
+    const pre = pane.querySelector('#hp-plot-out');
+    const txt = hpBuildDiagText(pre?.textContent || '');
+    const ok = await hpCopyText(txt);
+    const oldTxt = copyBtn.textContent;
+    copyBtn.textContent = ok ? '已复制 ✓ 可粘贴发给开发者' : '复制失败，请长按下方文字';
+    setTimeout(() => { copyBtn.textContent = oldTxt; }, 2200);
   });
   pane.querySelectorAll('[data-ptapi]').forEach(el => {
     const commit = () => {
@@ -6084,6 +6269,46 @@ async function updateIdxStatus(pane) {
   el.textContent = lines.join('\n');
 }
 
+
+/* 【v1.38】移动端没有控制台，诊断信息一键复制出来 */
+function hpBuildDiagText(wbOut) {
+  const s = settings || {};
+  const L = [];
+  L.push('HP-DeepLore 诊断 · v1.38.0');
+  L.push('时间：' + new Date().toLocaleString('zh-CN'));
+  L.push('世界书：' + (s.plotWorldbookName || '(未手动指定，靠自动探测)'));
+  L.push('定位范围：±' + (s.plotRange == null ? 1 : s.plotRange) + ' 章');
+  L.push('上次定位：' + (s.plotLastCh ? ('第 ' + s.plotLastCh + ' 章 · ' + (s.plotLastWhy || '')) : '尚未定位过'));
+  L.push('永久记忆：' + (s.memEnabled ? '已启用' : '关闭') + '｜后端 ' + (s.memBaseUrl || '(未填)'));
+  L.push('自动定位：' + (s.plotAuto ? '开' : '关'));
+  L.push('');
+  L.push('--- 世界书检测 ---');
+  const body = String(wbOut || '').trim();
+  L.push(body || '(还没检测过 —— 请先点「检测世界书」再复制)');
+  return L.join('\n');
+}
+
+async function hpCopyText(t) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(t);
+      return true;
+    }
+  } catch (e) { /* 落到下面的老办法 */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = t;
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return !!ok;
+  } catch (e) { return false; }
+}
 
 /* ==========================================================================
  * UI 层：魔法棒菜单入口 / 模态面板 / 浮动节点面板
@@ -6477,34 +6702,13 @@ function renderSettingsInto(host) {
       host.querySelectorAll('.hp-nv').forEach(x => x.classList.remove('on'));
       n.classList.add('on');
       UI.panelTab = Number(n.dataset.p);
-      safeRenderPane(host, host.querySelector('#hp-pane-host'), UI.panelTab);
+      host.querySelector('#hp-pane-host').innerHTML = paneHTML(UI.panelTab);
+      bindPane(host);
     };
   });
   const ph = host.querySelector('#hp-pane-host');
-  safeRenderPane(host, ph, UI.panelTab);
-}
-
-/* 【修 v1.37】单个面板渲染出错时，旧代码会让整个设置页变成空白且静默无提示。
-   现在：出错只影响当前这一页，错误原文直接显示在页面上，其余页照常可用。 */
-function safeRenderPane(host, ph, tab) {
-  const nm = (typeof PANES !== 'undefined' && PANES[tab]) ? PANES[tab] : ('第' + tab + '页');
-  try {
-    ph.innerHTML = paneHTML(tab);
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    console.error('[HP-DeepLore] paneHTML 渲染失败 tab=' + tab, e);
-    try {
-      ph.innerHTML = '<div style="padding:14px;line-height:1.7;color:#ff8a8a">'
-        + '「' + String(nm).replace(/[<>&]/g, '') + '」页渲染失败：<br>' + msg.replace(/[<>&]/g, '')
-        + '<br><br>其余页面不受影响，可正常切换。</div>';
-    } catch (_) { /* 忽略 */ }
-    return;
-  }
-  try {
-    bindPane(host);
-  } catch (e) {
-    console.error('[HP-DeepLore] bindPane 绑定失败 tab=' + tab, e);
-  }
+  ph.innerHTML = paneHTML(UI.panelTab);
+  bindPane(host);
 }
 
 /* 节点面板渲染到指定容器 */
@@ -7651,6 +7855,9 @@ function boot() {
         // v1.26 Slash 命令通道
         wbSlashProbe, wbSlashRun, wbSlashSetEntry, wbCurrentName, entryName, wbReadLive,
         wbVerify, wbReadAny, thGet, thHas, entryIsEnabled, entryNeedFix, setEntryEnabled,
+        // v1.38 恢复默认剧情条目
+        wbResetPlot, wbPlotState, chRanges,
+        hpBuildDiagText, hpCopyText,
       };
     } catch (e) { /* 忽略 */ }
     console.log('  · 菜单入口 : ' + (inMenu ? '✓ 已挂到魔法棒菜单' : '✗ 未找到菜单容器（已用悬浮球 ◈ 兜底）'));
